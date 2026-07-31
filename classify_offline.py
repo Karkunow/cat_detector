@@ -81,7 +81,7 @@ def dump(clips_dir: Path, config: dict) -> None:
                 print(f"  t={t:5.1f}s day={day!s:5} (no cat detected)")
 
 
-def classify_clip(clip_path: Path, config: dict) -> dict:
+def classify_clip(clip_path: Path, config: dict) -> list[dict]:
     return classify_frames(iter_clip_frames(clip_path, config["sample_fps"]), config)
 
 
@@ -96,21 +96,23 @@ def run(clips_dir: Path, config: dict, clear: bool) -> None:
         return
 
     for clip_path in clips:
-        result = classify_clip(clip_path, config)
+        results = classify_clip(clip_path, config)
         timestamp = datetime.fromtimestamp(clip_path.stat().st_mtime).isoformat()
-        storage.insert_event(
-            conn,
-            timestamp=timestamp,
-            cat=result["cat"],
-            is_day=result["is_day"],
-            confidence=result["confidence"],
-            dwell_seconds=result["dwell_seconds"],
-            source_clip=clip_path.name,
-        )
-        print(
-            f"{clip_path.name:30} -> cat={result['cat']:12} day={result['is_day']!s:5} "
-            f"dwell={result['dwell_seconds']:5.1f}s conf={result['confidence']:.2f}"
-        )
+        for i, result in enumerate(results):
+            storage.insert_event(
+                conn,
+                timestamp=timestamp,
+                cat=result["cat"],
+                is_day=result["is_day"],
+                confidence=result["confidence"],
+                dwell_seconds=result["dwell_seconds"],
+                source_clip=clip_path.name,
+            )
+            label = clip_path.name if i == 0 else f"{clip_path.name} (episode {i + 1})"
+            print(
+                f"{label:30} -> cat={result['cat']:12} day={result['is_day']!s:5} "
+                f"dwell={result['dwell_seconds']:5.1f}s conf={result['confidence']:.2f}"
+            )
 
 
 def main() -> None:

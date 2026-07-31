@@ -62,29 +62,30 @@ async def main() -> None:
 
         try:
             now = datetime.now()
-            result = await asyncio.to_thread(classify_frames, frames, config, now.hour)
+            results = await asyncio.to_thread(classify_frames, frames, config, now.hour)
             timestamp = now.isoformat()
-            storage.insert_event(
-                conn,
-                timestamp=timestamp,
-                cat=result["cat"],
-                is_day=result["is_day"],
-                confidence=result["confidence"],
-                dwell_seconds=result["dwell_seconds"],
-                source_clip="live",
-            )
-            frame = result.get("best_frame")
-            loggable = {k: v for k, v in result.items() if k != "best_frame"}
-            logger.info("Event classified: %s (photo: %s)", loggable, frame is not None)
+            for result in results:
+                storage.insert_event(
+                    conn,
+                    timestamp=timestamp,
+                    cat=result["cat"],
+                    is_day=result["is_day"],
+                    confidence=result["confidence"],
+                    dwell_seconds=result["dwell_seconds"],
+                    source_clip="live",
+                )
+                frame = result.get("best_frame")
+                loggable = {k: v for k, v in result.items() if k != "best_frame"}
+                logger.info("Event classified: %s (photo: %s)", loggable, frame is not None)
 
-            if result["cat"] in ("white", "black"):
-                telegram_notify.notify_visit(
-                    result["cat"], result["is_day"], result["dwell_seconds"], frame=frame
-                )
-            elif result["cat"] in ("white_passby", "black_passby"):
-                telegram_notify.notify_passby(
-                    result["cat"].removesuffix("_passby"), result["is_day"], frame=frame
-                )
+                if result["cat"] in ("white", "black"):
+                    telegram_notify.notify_visit(
+                        result["cat"], result["is_day"], result["dwell_seconds"], frame=frame
+                    )
+                elif result["cat"] in ("white_passby", "black_passby"):
+                    telegram_notify.notify_passby(
+                        result["cat"].removesuffix("_passby"), result["is_day"], frame=frame
+                    )
         except asyncio.CancelledError:
             raise
         except Exception:
