@@ -55,26 +55,28 @@ async def main() -> None:
             if not frames:
                 continue
 
-            result = await asyncio.to_thread(classify_frames, frames, config)
-            timestamp = datetime.now().isoformat()
-            storage.insert_event(
-                conn,
-                timestamp=timestamp,
-                cat=result["cat"],
-                is_day=result["is_day"],
-                confidence=result["confidence"],
-                dwell_seconds=result["dwell_seconds"],
-                source_clip="live",
-            )
-            logger.info("Event classified: %s", result)
-
             try:
+                result = await asyncio.to_thread(classify_frames, frames, config)
+                timestamp = datetime.now().isoformat()
+                storage.insert_event(
+                    conn,
+                    timestamp=timestamp,
+                    cat=result["cat"],
+                    is_day=result["is_day"],
+                    confidence=result["confidence"],
+                    dwell_seconds=result["dwell_seconds"],
+                    source_clip="live",
+                )
+                logger.info("Event classified: %s", result)
+
                 if result["cat"] in ("white", "black"):
                     telegram_notify.notify_visit(result["cat"], result["is_day"], result["dwell_seconds"])
                 elif result["cat"] in ("white_passby", "black_passby"):
                     telegram_notify.notify_passby(result["cat"].removesuffix("_passby"), result["is_day"])
+            except asyncio.CancelledError:
+                raise
             except Exception:
-                logger.exception("Failed to send Telegram notification")
+                logger.exception("Failed to process/notify motion event, continuing")
 
 
 async def run_with_graceful_shutdown() -> None:

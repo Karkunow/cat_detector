@@ -125,7 +125,15 @@ async def watch_motion_events(host: str, port: int, user: str, password: str):
     stuck/stale subscription (e.g. left over from an unclean previous shutdown)
     doesn't recover by just retrying the same call."""
     while True:
-        cam, manager = await _subscribe(host, port, user, password)
+        try:
+            cam, manager = await _subscribe(host, port, user, password)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.warning("Failed to (re)subscribe, retrying in 5s", exc_info=True)
+            await asyncio.sleep(5)
+            continue
+
         service = manager.get_service()
         logger.info("Subscribed to ONVIF motion events on %s", host)
 
