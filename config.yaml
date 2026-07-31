@@ -13,6 +13,15 @@ roi: [0.30, 0.05, 1.00, 0.65]
 min_dwell_seconds: 12
 dwell_gap_tolerance_seconds: 2.0
 
+# Known cosmetic issue (not fixed): dark leather furniture at the far-left frame
+# edge gets misdetected as "person" at ~0.4-0.46 confidence, which can occasionally
+# tip a passby event into being mislabeled "human" instead of a cat color. Tried an
+# ignore_zone and a raised person-confidence threshold; both would also cut real cat
+# and real human detections that fall in the same region/confidence range, so
+# rejected. Doesn't affect confirmed-visit classification (dwell check runs first,
+# before the human/passby branch), only the secondary passby notification. See git
+# history around 2026-07-31 for the investigation.
+
 # Mean grayscale brightness (0-255) of the YOLO-cropped cat region, calibrated from
 # median brightness per sample clip (day: black~79 vs white~124; night: black~54 vs
 # white~173). Gap between black_max/white_min is a deliberate "unknown" buffer.
