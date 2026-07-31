@@ -43,50 +43,74 @@ async def main() -> None:
     grabber = MotionCapture(rtsp_url, config["sample_fps"])
     grabber.start_reader()
     capturing = False
+    finalize_task: asyncio.Task | None = None
+    coalesce_gap = config.get("motion_coalesce_gap_seconds", 3.0)
+
+    async def finalize_event() -> None:
+        nonlocal capturing, finalize_task
+        try:
+            await asyncio.sleep(coalesce_gap)
+        except asyncio.CancelledError:
+            return
+
+        frames = grabber.stop_event()
+        capturing = False
+        finalize_task = None
+        logger.info("Motion event finalized, %d frames captured", len(frames))
+        if not frames:
+            return
+
+        try:
+            now = datetime.now()
+            result = await asyncio.to_thread(classify_frames, frames, config, now.hour)
+            timestamp = now.isoformat()
+            storage.insert_event(
+                conn,
+                timestamp=timestamp,
+                cat=result["cat"],
+                is_day=result["is_day"],
+                confidence=result["confidence"],
+                dwell_seconds=result["dwell_seconds"],
+                source_clip="live",
+            )
+            frame = result.get("best_frame")
+            loggable = {k: v for k, v in result.items() if k != "best_frame"}
+            logger.info("Event classified: %s (photo: %s)", loggable, frame is not None)
+
+            if result["cat"] in ("white", "black"):
+                telegram_notify.notify_visit(
+                    result["cat"], result["is_day"], result["dwell_seconds"], frame=frame
+                )
+            elif result["cat"] in ("white_passby", "black_passby"):
+                telegram_notify.notify_passby(
+                    result["cat"].removesuffix("_passby"), result["is_day"], frame=frame
+                )
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception("Failed to process/notify motion event, continuing")
 
     try:
         async for motion in watch_motion_events(host, onvif_port, user, password):
-            if motion and not capturing:
-                logger.info("Motion started")
-                grabber.start_event()
-                capturing = True
-            elif not motion and capturing:
-                frames = grabber.stop_event()
-                capturing = False
-                logger.info("Motion stopped, %d frames captured", len(frames))
-                if not frames:
-                    continue
-
-                try:
-                    now = datetime.now()
-                    result = await asyncio.to_thread(classify_frames, frames, config, now.hour)
-                    timestamp = now.isoformat()
-                    storage.insert_event(
-                        conn,
-                        timestamp=timestamp,
-                        cat=result["cat"],
-                        is_day=result["is_day"],
-                        confidence=result["confidence"],
-                        dwell_seconds=result["dwell_seconds"],
-                        source_clip="live",
-                    )
-                    frame = result.get("best_frame")
-                    loggable = {k: v for k, v in result.items() if k != "best_frame"}
-                    logger.info("Event classified: %s (photo: %s)", loggable, frame is not None)
-
-                    if result["cat"] in ("white", "black"):
-                        telegram_notify.notify_visit(
-                            result["cat"], result["is_day"], result["dwell_seconds"], frame=frame
-                        )
-                    elif result["cat"] in ("white_passby", "black_passby"):
-                        telegram_notify.notify_passby(
-                            result["cat"].removesuffix("_passby"), result["is_day"], frame=frame
-                        )
-                except asyncio.CancelledError:
-                    raise
-                except Exception:
-                    logger.exception("Failed to process/notify motion event, continuing")
+            if motion:
+                if not capturing:
+                    logger.info("Motion started")
+                    grabber.start_event()
+                    capturing = True
+                if finalize_task is not None:
+                    finalize_task.cancel()
+                    finalize_task = None
+                    logger.info("Motion resumed within coalesce window, continuing same event")
+            elif capturing and finalize_task is None:
+                # Don't finalize immediately -- the camera's motion state can flicker
+                # off/on in short bursts during one continuous cat presence (observed
+                # live: several sub-threshold fragments of what was clearly one visit).
+                # Wait a short grace period; a motion-start during it cancels this and
+                # the event just keeps accumulating frames instead of being split.
+                finalize_task = asyncio.create_task(finalize_event())
     finally:
+        if finalize_task is not None:
+            finalize_task.cancel()
         grabber.stop_reader()
 
 

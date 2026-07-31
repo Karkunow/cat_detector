@@ -16,6 +16,13 @@ roi: [0.30, 0.05, 1.00, 0.65]
 min_dwell_seconds: 12
 dwell_gap_tolerance_seconds: 2.0
 
+# If the camera's ONVIF motion state flickers off/on again within this many
+# seconds, main.py treats it as still the same logical event instead of
+# finalizing/classifying the fragment early. Observed live: one continuous cat
+# presence split into several sub-threshold "Motion started/stopped" pairs a
+# few seconds apart, each never reaching min_dwell_seconds on its own.
+motion_coalesce_gap_seconds: 3.0
+
 # Known cosmetic issue (not fixed): dark leather furniture at the far-left frame
 # edge gets misdetected as "person" at ~0.4-0.46 confidence, which can occasionally
 # tip a passby event into being mislabeled "human" instead of a cat color. Tried an
