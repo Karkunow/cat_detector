@@ -1,6 +1,9 @@
 # Phase A placeholders — will be tuned from calibration dump output (see PLAN.md).
 
-sample_fps: 2          # how many frames per second to sample from each clip
+sample_fps: 4          # how many frames per second to sample from each clip.
+# Raised from 2 after a live miss (a cat visible for only ~0.3s slipped between
+# 2fps samples) and after switching to a persistent RTSP connection made extra
+# samples cheap (no longer paying per-event connection latency).
 yolo_confidence: 0.4
 
 # ROI = litter box entrance area, as fractions [x1, y1, x2, y2] of frame width/height.
