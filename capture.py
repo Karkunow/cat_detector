@@ -94,7 +94,11 @@ MAX_CONSECUTIVE_FAILURES = 3
 
 
 async def _subscribe(host: str, port: int, user: str, password: str):
-    cam = ONVIFCamera(host, port, user, password)
+    # no_cache: avoid the WSDL sqlite cache (seen implicated in long-session
+    # memory issues with some ONVIF cameras). adjust_time: Tapo cameras can
+    # reject WS-Security-authenticated requests (generic SOAP faults, no detail)
+    # if the camera's clock has drifted from ours -- this compensates for it.
+    cam = ONVIFCamera(host, port, user, password, no_cache=True, adjust_time=True)
     await cam.update_xaddrs()
 
     def on_subscription_lost():
