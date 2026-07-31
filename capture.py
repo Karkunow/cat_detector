@@ -103,7 +103,13 @@ async def _subscribe(host: str, port: int, user: str, password: str):
     # memory issues with some ONVIF cameras). adjust_time: Tapo cameras can
     # reject WS-Security-authenticated requests (generic SOAP faults, no detail)
     # if the camera's clock has drifted from ours -- this compensates for it.
-    cam = ONVIFCamera(host, port, user, password, no_cache=True, adjust_time=True)
+    # nat_override: this camera's CreatePullPointSubscription response advertises
+    # a bogus internal port (e.g. :1028) for its own SubscriptionReference address
+    # instead of the port we actually connected on (:2020) -- observed directly via
+    # "TimeoutError: Request to http://<host>:1028/event-... timed out". With
+    # nat_override, the library ignores that self-reported address and always
+    # talks back to the host:port we originally connected to.
+    cam = ONVIFCamera(host, port, user, password, no_cache=True, adjust_time=True, nat_override=True)
     await cam.update_xaddrs()
 
     def on_subscription_lost():
