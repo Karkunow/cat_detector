@@ -14,7 +14,14 @@ yolo_confidence: 0.4
 roi: [0.30, 0.05, 1.00, 0.65]
 
 min_dwell_seconds: 12
-dwell_gap_tolerance_seconds: 2.0
+dwell_gap_tolerance_seconds: 30.0
+# Raised from 2.0: this litter box is an enclosed dome, so a cat genuinely
+# inside using it is mostly invisible to the camera (only visible briefly at
+# the entrance). User confirmed real litter box visits (with elimination) got
+# classified as passby, not visits -- the old 2s tolerance meant the dwell
+# tracker's progress stalled during the long invisible stretch of real usage.
+# 30s assumes: once the cat is seen entering the ROI, it's still "in the box"
+# even if undetected for a while, unless the gap is implausibly long.
 
 # If the camera's ONVIF motion state flickers off/on again within this many
 # seconds, main.py treats it as still the same logical event instead of
