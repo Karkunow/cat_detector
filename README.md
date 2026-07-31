@@ -69,8 +69,21 @@ false positive.
 backlit, at 0.28-0.46 confidence — below our `sample_fps: 2` sampling grid (samples landed
 on either side of the ~0.3s window) and marginal even when checked frame-by-frame. Decided
 not to chase this: the cat wasn't heading to the box anyway (entered right, exited left), so
-it wasn't a real "visit" candidate regardless of detection. Revisit only if this pattern
-starts affecting real box *visits*, not just passersby.
+it wasn't a real "visit" candidate regardless of detection.
+
+`night_white_passby_3` (live miss, confirmed against the real matching clip): a white cat
+at the far-right frame edge under IR at night — cropped by the frame boundary, severely
+overexposed/blown-out by the IR illuminator at close range (destroys texture/edges), and
+motion-blurred. Zero detections across the *entire* clip (1096 frames) even at
+`conf=0.05`, including the one frame a human can clearly identify a cat in. This is a
+harder failure mode than the sampling-gap misses above -- it's not about catching the right
+frame, YOLO just can't extract features from this specific combination of edge-crop +
+IR blowout + blur. Not fixable by tuning `sample_fps`/`yolo_confidence`; would need a
+fine-tuned model or exposure preprocessing to address. Same mitigating factor as above:
+these are passersby, not box visits.
+
+Revisit either only if this pattern starts affecting real box *visits*, not just
+passersby.
 
 ### Important recalibration: IR brightness ≠ visible-light color
 
