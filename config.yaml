@@ -21,8 +21,8 @@ thresholds:
     white_min: 100
     black_max: 90
   night:
-    white_min: 90
-    black_max: 70
+    white_min: 150
+    black_max: 135
 
 # Phase B additions (camera/telegram) go here once we get to live triggering:
 # rtsp_url: "rtsp://camuser:campass@<ip>:554/stream2"
