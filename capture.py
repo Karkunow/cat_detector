@@ -18,11 +18,12 @@ from onvif import ONVIFCamera
 logger = logging.getLogger(__name__)
 
 MOTION_TOPIC_HINTS = ("motion", "cellmotiondetector")
-PULL_TIMEOUT = "PT10S"  # ONVIF duration: block up to 10s per PullMessages call.
+PULL_TIMEOUT = "PT5S"  # ONVIF duration: block up to 5s per PullMessages call.
 # Kept short since Tapo's lightweight network stack appears to unilaterally drop
 # long-held long-poll connections (ServerDisconnectedError) -- shorter polls mean
 # more requests, but each is less likely to outlast whatever the camera's own
-# connection timeout is.
+# connection timeout is. 5s matches what other ONVIF client examples use
+# successfully against similar embedded cameras.
 MAX_EVENT_SECONDS = 120  # safety cap so a stuck "motion=true" can't capture forever
 
 
