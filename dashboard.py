@@ -30,7 +30,7 @@ if not visits.empty:
     daily = visits.groupby(["date", "cat"]).size().unstack(fill_value=0)
     st.bar_chart(daily, color=[CAT_COLORS.get(c, "#888888") for c in daily.columns])
 else:
-    st.info("Поки що жодного підтвердженого візиту (тільки pass_through/human/unknown).")
+    st.info("Поки що жодного підтвердженого візиту (тільки passby/unknown).")
 
 st.subheader("День vs ніч")
 if not visits.empty:

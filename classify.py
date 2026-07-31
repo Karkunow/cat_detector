@@ -97,7 +97,6 @@ def classify_frames(frame_iter, config: dict) -> dict:
 
     day_votes = []
     brightness_samples = []
-    person_frames = 0
     cat_frames = 0
     total_frames = 0
     max_conf = 0.0
@@ -109,7 +108,6 @@ def classify_frames(frame_iter, config: dict) -> dict:
         day_votes.append(is_day_frame(frame))
         dets = detect(frame, config["yolo_confidence"])
         cat_det = best_detection(dets, "cat")
-        person_det = best_detection(dets, "person")
 
         inside = False
         if cat_det:
@@ -122,9 +120,6 @@ def classify_frames(frame_iter, config: dict) -> dict:
             if cat_det.confidence > best_cat_conf:
                 best_cat_conf = cat_det.confidence
                 best_cat_frame = frame
-        elif person_det:
-            person_frames += 1
-            max_conf = max(max_conf, person_det.confidence)
 
         dwell.update(t, inside)
 
@@ -133,20 +128,11 @@ def classify_frames(frame_iter, config: dict) -> dict:
     if total_frames == 0:
         return {"cat": "unknown", "is_day": is_day, "confidence": 0.0, "dwell_seconds": 0.0}
 
-    # A confirmed dwell in the ROI (sustained cat presence at the box) wins even if a
-    # person also appears elsewhere in the same event (e.g. owner walks by earlier/later).
+    # A confirmed dwell in the ROI (sustained cat presence at the box) wins.
     if dwell.dwell_seconds >= config["min_dwell_seconds"]:
         brightness = statistics.median(brightness_samples)
         label = classify_cat_color(brightness, is_day, thresholds)
         confirmed_visit = True
-    elif person_frames > cat_frames and person_frames > total_frames * 0.15:
-        return {
-            "cat": "human",
-            "is_day": is_day,
-            "confidence": max_conf,
-            "dwell_seconds": 0.0,
-            "confirmed_visit": False,
-        }
     elif cat_frames == 0:
         return {
             "cat": "unknown",

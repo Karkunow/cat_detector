@@ -60,7 +60,6 @@ def dump(clips_dir: Path, config: dict) -> None:
             day = is_day_frame(frame)
             dets = detect(frame, config["yolo_confidence"])
             cat_det = best_detection(dets, "cat")
-            person_det = best_detection(dets, "person")
 
             if not saved_reference:
                 out = CALIBRATION_DIR / "reference_frame.jpg"
@@ -78,10 +77,8 @@ def dump(clips_dir: Path, config: dict) -> None:
                     f"  t={t:5.1f}s day={day!s:5} cat conf={cat_det.confidence:.2f} "
                     f"brightness={brightness:6.1f} bbox={cat_det.bbox} -> {crop_path.name}"
                 )
-            elif person_det:
-                print(f"  t={t:5.1f}s day={day!s:5} person conf={person_det.confidence:.2f}")
             else:
-                print(f"  t={t:5.1f}s day={day!s:5} (no cat/person detected)")
+                print(f"  t={t:5.1f}s day={day!s:5} (no cat detected)")
 
 
 def classify_clip(clip_path: Path, config: dict) -> dict:
