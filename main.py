@@ -3,6 +3,7 @@
 import asyncio
 import logging
 import os
+import signal
 from datetime import datetime
 from pathlib import Path
 
@@ -76,5 +77,22 @@ async def main() -> None:
                 logger.exception("Failed to send Telegram notification")
 
 
+async def run_with_graceful_shutdown() -> None:
+    loop = asyncio.get_running_loop()
+    task = asyncio.ensure_future(main())
+
+    def _cancel():
+        logger.info("Shutdown signal received, closing ONVIF subscription cleanly...")
+        task.cancel()
+
+    for sig in (signal.SIGTERM, signal.SIGINT):
+        loop.add_signal_handler(sig, _cancel)
+
+    try:
+        await task
+    except asyncio.CancelledError:
+        logger.info("Shutdown complete")
+
+
 if __name__ == "__main__":
-    asyncio.run(main())
+    asyncio.run(run_with_graceful_shutdown())

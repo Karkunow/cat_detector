@@ -90,8 +90,10 @@ def _extract_motion_state(message) -> bool | None:
     return None
 
 
-async def watch_motion_events(host: str, port: int, user: str, password: str):
-    """Async generator yielding True on motion-start and False on motion-stop."""
+MAX_CONSECUTIVE_FAILURES = 3
+
+
+async def _subscribe(host: str, port: int, user: str, password: str):
     cam = ONVIFCamera(host, port, user, password)
     await cam.update_xaddrs()
 
@@ -100,22 +102,56 @@ async def watch_motion_events(host: str, port: int, user: str, password: str):
 
     manager = await cam.create_pullpoint_manager(dt.timedelta(minutes=10), on_subscription_lost)
     await manager.start()
-    service = manager.get_service()
+    return cam, manager
 
-    logger.info("Subscribed to ONVIF motion events on %s", host)
+
+async def _close(cam: ONVIFCamera, manager) -> None:
+    # Best-effort: if the connection is already broken, these will raise too --
+    # that's fine, we're tearing down regardless.
     try:
-        while True:
-            try:
-                result = await service.PullMessages({"Timeout": PULL_TIMEOUT, "MessageLimit": 20})
-            except Exception:
-                logger.exception("PullMessages failed, retrying in 5s")
-                await asyncio.sleep(5)
-                continue
-
-            for message in getattr(result, "NotificationMessage", []) or []:
-                state = _extract_motion_state(message)
-                if state is not None:
-                    yield state
-    finally:
         await manager.stop()
+    except Exception:
+        logger.debug("manager.stop() failed during teardown, ignoring", exc_info=True)
+    try:
         await cam.close()
+    except Exception:
+        logger.debug("cam.close() failed during teardown, ignoring", exc_info=True)
+
+
+async def watch_motion_events(host: str, port: int, user: str, password: str):
+    """Async generator yielding True on motion-start and False on motion-stop.
+
+    Re-subscribes from scratch after repeated PullMessages failures, since a
+    stuck/stale subscription (e.g. left over from an unclean previous shutdown)
+    doesn't recover by just retrying the same call."""
+    while True:
+        cam, manager = await _subscribe(host, port, user, password)
+        service = manager.get_service()
+        logger.info("Subscribed to ONVIF motion events on %s", host)
+
+        consecutive_failures = 0
+        try:
+            while True:
+                try:
+                    result = await service.PullMessages({"Timeout": PULL_TIMEOUT, "MessageLimit": 20})
+                    consecutive_failures = 0
+                except Exception:
+                    consecutive_failures += 1
+                    logger.warning(
+                        "PullMessages failed (%d/%d), retrying in 5s",
+                        consecutive_failures,
+                        MAX_CONSECUTIVE_FAILURES,
+                        exc_info=True,
+                    )
+                    if consecutive_failures >= MAX_CONSECUTIVE_FAILURES:
+                        logger.warning("Too many consecutive failures, re-subscribing from scratch")
+                        break
+                    await asyncio.sleep(5)
+                    continue
+
+                for message in getattr(result, "NotificationMessage", []) or []:
+                    state = _extract_motion_state(message)
+                    if state is not None:
+                        yield state
+        finally:
+            await _close(cam, manager)
