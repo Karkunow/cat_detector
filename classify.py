@@ -9,9 +9,20 @@ DAY_SATURATION_THRESHOLD = 20  # mean saturation below this => treated as IR/nig
 
 
 def is_day_frame(frame, sat_threshold: float = DAY_SATURATION_THRESHOLD) -> bool:
+    """Image-based day/night guess via color saturation. Unreliable for scenes
+    dominated by white/gray objects (e.g. a white litter box against white walls
+    has low saturation even in bright daylight) -- prefer is_day_time() when a
+    real clock is available (i.e. live, not replaying an offline test clip)."""
     hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
     mean_sat = float(np.mean(hsv[:, :, 1]))
     return mean_sat >= sat_threshold
+
+
+def is_day_time(hour: int, day_start_hour: int = 7, day_end_hour: int = 21) -> bool:
+    """Wall-clock day/night check. Coarse (fixed hours, no actual sunrise/sunset
+    calculation) but far more reliable than image saturation for scenes that are
+    mostly white/gray regardless of lighting."""
+    return day_start_hour <= hour < day_end_hour
 
 
 def crop_bbox(frame, bbox: tuple[int, int, int, int]):
@@ -85,12 +96,17 @@ def best_detection(detections: list[Detection], label: str) -> Detection | None:
     return max(candidates, key=lambda d: d.confidence)
 
 
-def classify_frames(frame_iter, config: dict) -> dict:
+def classify_frames(frame_iter, config: dict, current_hour: int | None = None) -> dict:
     """Runs the full detect -> color/ROI/dwell pipeline over an iterable of (t, frame)
     pairs (t = seconds since the event started) and returns a result dict:
     {cat, is_day, confidence, dwell_seconds}. Used identically by the offline
     (Phase A, frames from a saved clip) and live (Phase B, frames from RTSP during
-    a motion event) drivers."""
+    a motion event) drivers.
+
+    current_hour: if given (live use -- pass datetime.now().hour), day/night is
+    decided from the wall clock via is_day_time() instead of image saturation.
+    Offline clip replay has no real "now", so it falls back to the per-frame
+    saturation vote (see is_day_frame's caveat about white/gray-dominated scenes)."""
     roi = config["roi"]
     thresholds = config["thresholds"]
     dwell = DwellTracker(gap_tolerance_seconds=config["dwell_gap_tolerance_seconds"])
@@ -105,7 +121,8 @@ def classify_frames(frame_iter, config: dict) -> dict:
 
     for t, frame in frame_iter:
         total_frames += 1
-        day_votes.append(is_day_frame(frame))
+        if current_hour is None:
+            day_votes.append(is_day_frame(frame))
         dets = detect(frame, config["yolo_confidence"])
         cat_det = best_detection(dets, "cat")
 
@@ -123,7 +140,10 @@ def classify_frames(frame_iter, config: dict) -> dict:
 
         dwell.update(t, inside)
 
-    is_day = (sum(day_votes) / len(day_votes)) >= 0.5 if day_votes else True
+    if current_hour is not None:
+        is_day = is_day_time(current_hour)
+    else:
+        is_day = (sum(day_votes) / len(day_votes)) >= 0.5 if day_votes else True
 
     if total_frames == 0:
         return {"cat": "unknown", "is_day": is_day, "confidence": 0.0, "dwell_seconds": 0.0}

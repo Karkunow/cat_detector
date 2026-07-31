@@ -58,8 +58,9 @@ async def main() -> None:
                     continue
 
                 try:
-                    result = await asyncio.to_thread(classify_frames, frames, config)
-                    timestamp = datetime.now().isoformat()
+                    now = datetime.now()
+                    result = await asyncio.to_thread(classify_frames, frames, config, now.hour)
+                    timestamp = now.isoformat()
                     storage.insert_event(
                         conn,
                         timestamp=timestamp,
