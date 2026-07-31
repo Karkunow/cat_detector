@@ -1,0 +1,29 @@
+# Phase A placeholders — will be tuned from calibration dump output (see PLAN.md).
+
+sample_fps: 2          # how many frames per second to sample from each clip
+yolo_confidence: 0.4
+
+# ROI = litter box entrance area, as fractions [x1, y1, x2, y2] of frame width/height.
+# Calibrated from data/calibration crops: camera is mounted right at the box entrance,
+# so "inside" events have the cat's bbox center roughly in the right/upper-middle of
+# frame; "passby" events (cat brushing the lens on the way elsewhere, or lounging in
+# the bottom corners) sit outside this band. See PLAN.md / README for known edge cases.
+roi: [0.30, 0.05, 1.00, 0.65]
+
+min_dwell_seconds: 12
+dwell_gap_tolerance_seconds: 2.0
+
+# Mean grayscale brightness (0-255) of the YOLO-cropped cat region, calibrated from
+# median brightness per sample clip (day: black~79 vs white~124; night: black~54 vs
+# white~173). Gap between black_max/white_min is a deliberate "unknown" buffer.
+thresholds:
+  day:
+    white_min: 100
+    black_max: 90
+  night:
+    white_min: 90
+    black_max: 70
+
+# Phase B additions (camera/telegram) go here once we get to live triggering:
+# rtsp_url: "rtsp://camuser:campass@<ip>:554/stream2"
+# telegram_bot_token / telegram_chat_id: kept in .env instead

@@ -1,0 +1,8 @@
+opencv-python
+ultralytics
+requests
+pyyaml
+streamlit
+pandas
+python-dotenv
+onvif-zeep-async
