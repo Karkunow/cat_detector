@@ -11,6 +11,7 @@ import datetime as dt
 import logging
 import threading
 import time
+from collections import deque
 
 import cv2
 from onvif import ONVIFCamera
@@ -27,51 +28,87 @@ PULL_TIMEOUT = "PT5S"  # ONVIF duration: block up to 5s per PullMessages call.
 MAX_EVENT_SECONDS = 120  # safety cap so a stuck "motion=true" can't capture forever
 
 
+PRE_ROLL_SECONDS = 2.0  # keep this much recent video buffered at all times, so a
+# motion event that's already brief by the time ONVIF tells us doesn't also lose
+# its first couple of seconds to RTSP connection setup latency.
+RECONNECT_BACKOFF = 2.0
+
+
 class MotionCapture:
-    """Opens the RTSP stream in a background thread and buffers (t, frame) pairs
-    from the moment start() is called until stop() is called."""
+    """Keeps the RTSP stream open continuously in a background thread (avoids
+    paying ~2-3s of RTSP connection/handshake latency on every single motion
+    event -- measured directly against this camera, and confirmed to cause real
+    misses on brief events). Always maintains a short rolling pre-roll buffer;
+    start_event()/stop_event() mark which frames belong to a motion event, seeded
+    with whatever pre-roll was already buffered so fast entrances aren't cut off."""
 
     def __init__(self, rtsp_url: str, sample_fps: float):
         self.rtsp_url = rtsp_url
         self.sample_fps = sample_fps
         self._thread: threading.Thread | None = None
-        self._stop_event = threading.Event()
-        self._frames: list[tuple[float, "cv2.Mat"]] = []
+        self._stop_reader = threading.Event()
+        self._lock = threading.Lock()
+        self._ring_buffer: deque[tuple[float, "cv2.Mat"]] = deque()
+        self._event_frames: list[tuple[float, "cv2.Mat"]] | None = None
 
-    def start(self) -> None:
-        self._frames = []
-        self._stop_event.clear()
+    def start_reader(self) -> None:
+        self._stop_reader.clear()
         self._thread = threading.Thread(target=self._run, daemon=True)
         self._thread.start()
 
-    def _run(self) -> None:
-        cap = cv2.VideoCapture(self.rtsp_url)
-        if not cap.isOpened():
-            logger.error("Failed to open RTSP stream at %s", self.rtsp_url)
-            return
-        start_t = time.monotonic()
-        last_sample_t = 0.0
-        min_interval = 1.0 / self.sample_fps
-        try:
-            while not self._stop_event.is_set():
-                ok, frame = cap.read()
-                if not ok:
-                    break
-                now = time.monotonic() - start_t
-                if now - last_sample_t >= min_interval:
-                    self._frames.append((now, frame))
-                    last_sample_t = now
-                if now > MAX_EVENT_SECONDS:
-                    logger.warning("Motion event exceeded %ss, cutting it off", MAX_EVENT_SECONDS)
-                    break
-        finally:
-            cap.release()
-
-    def stop(self) -> list[tuple[float, "cv2.Mat"]]:
-        self._stop_event.set()
+    def stop_reader(self) -> None:
+        self._stop_reader.set()
         if self._thread:
             self._thread.join(timeout=5)
-        return self._frames
+
+    def _run(self) -> None:
+        min_interval = 1.0 / self.sample_fps
+        while not self._stop_reader.is_set():
+            cap = cv2.VideoCapture(self.rtsp_url)
+            if not cap.isOpened():
+                logger.error("Failed to open RTSP stream at %s, retrying in %ss", self.rtsp_url, RECONNECT_BACKOFF)
+                cap.release()
+                time.sleep(RECONNECT_BACKOFF)
+                continue
+
+            last_sample_t = 0.0
+            try:
+                while not self._stop_reader.is_set():
+                    ok, frame = cap.read()
+                    if not ok:
+                        logger.warning("RTSP read failed, reconnecting")
+                        break
+                    now = time.monotonic()
+                    if now - last_sample_t < min_interval:
+                        continue
+                    last_sample_t = now
+                    with self._lock:
+                        if self._event_frames is not None:
+                            self._event_frames.append((now, frame))
+                            if now - self._event_frames[0][0] > MAX_EVENT_SECONDS:
+                                logger.warning("Motion event exceeded %ss, cutting it off", MAX_EVENT_SECONDS)
+                                self._event_frames = self._event_frames[-1:]
+                        else:
+                            self._ring_buffer.append((now, frame))
+                            while self._ring_buffer and now - self._ring_buffer[0][0] > PRE_ROLL_SECONDS:
+                                self._ring_buffer.popleft()
+            finally:
+                cap.release()
+            if not self._stop_reader.is_set():
+                time.sleep(RECONNECT_BACKOFF)
+
+    def start_event(self) -> None:
+        with self._lock:
+            self._event_frames = list(self._ring_buffer)
+
+    def stop_event(self) -> list[tuple[float, "cv2.Mat"]]:
+        with self._lock:
+            frames = self._event_frames or []
+            self._event_frames = None
+        if not frames:
+            return []
+        t0 = frames[0][0]
+        return [(t - t0, frame) for t, frame in frames]
 
 
 def _extract_motion_state(message) -> bool | None:

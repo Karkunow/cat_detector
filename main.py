@@ -18,7 +18,7 @@ from classify import classify_frames
 
 CONFIG_PATH = Path(__file__).parent / "config.yaml"
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s", force=True)
 logger = logging.getLogger(__name__)
 
 
@@ -41,48 +41,52 @@ async def main() -> None:
 
     conn = storage.init_db()
     grabber = MotionCapture(rtsp_url, config["sample_fps"])
+    grabber.start_reader()
     capturing = False
 
-    async for motion in watch_motion_events(host, onvif_port, user, password):
-        if motion and not capturing:
-            logger.info("Motion started")
-            grabber.start()
-            capturing = True
-        elif not motion and capturing:
-            frames = grabber.stop()
-            capturing = False
-            logger.info("Motion stopped, %d frames captured", len(frames))
-            if not frames:
-                continue
+    try:
+        async for motion in watch_motion_events(host, onvif_port, user, password):
+            if motion and not capturing:
+                logger.info("Motion started")
+                grabber.start_event()
+                capturing = True
+            elif not motion and capturing:
+                frames = grabber.stop_event()
+                capturing = False
+                logger.info("Motion stopped, %d frames captured", len(frames))
+                if not frames:
+                    continue
 
-            try:
-                result = await asyncio.to_thread(classify_frames, frames, config)
-                timestamp = datetime.now().isoformat()
-                storage.insert_event(
-                    conn,
-                    timestamp=timestamp,
-                    cat=result["cat"],
-                    is_day=result["is_day"],
-                    confidence=result["confidence"],
-                    dwell_seconds=result["dwell_seconds"],
-                    source_clip="live",
-                )
-                frame = result.get("best_frame")
-                loggable = {k: v for k, v in result.items() if k != "best_frame"}
-                logger.info("Event classified: %s (photo: %s)", loggable, frame is not None)
+                try:
+                    result = await asyncio.to_thread(classify_frames, frames, config)
+                    timestamp = datetime.now().isoformat()
+                    storage.insert_event(
+                        conn,
+                        timestamp=timestamp,
+                        cat=result["cat"],
+                        is_day=result["is_day"],
+                        confidence=result["confidence"],
+                        dwell_seconds=result["dwell_seconds"],
+                        source_clip="live",
+                    )
+                    frame = result.get("best_frame")
+                    loggable = {k: v for k, v in result.items() if k != "best_frame"}
+                    logger.info("Event classified: %s (photo: %s)", loggable, frame is not None)
 
-                if result["cat"] in ("white", "black"):
-                    telegram_notify.notify_visit(
-                        result["cat"], result["is_day"], result["dwell_seconds"], frame=frame
-                    )
-                elif result["cat"] in ("white_passby", "black_passby"):
-                    telegram_notify.notify_passby(
-                        result["cat"].removesuffix("_passby"), result["is_day"], frame=frame
-                    )
-            except asyncio.CancelledError:
-                raise
-            except Exception:
-                logger.exception("Failed to process/notify motion event, continuing")
+                    if result["cat"] in ("white", "black"):
+                        telegram_notify.notify_visit(
+                            result["cat"], result["is_day"], result["dwell_seconds"], frame=frame
+                        )
+                    elif result["cat"] in ("white_passby", "black_passby"):
+                        telegram_notify.notify_passby(
+                            result["cat"].removesuffix("_passby"), result["is_day"], frame=frame
+                        )
+                except asyncio.CancelledError:
+                    raise
+                except Exception:
+                    logger.exception("Failed to process/notify motion event, continuing")
+    finally:
+        grabber.stop_reader()
 
 
 async def run_with_graceful_shutdown() -> None:
