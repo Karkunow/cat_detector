@@ -101,6 +101,8 @@ def classify_frames(frame_iter, config: dict) -> dict:
     cat_frames = 0
     total_frames = 0
     max_conf = 0.0
+    best_cat_frame = None
+    best_cat_conf = 0.0
 
     for t, frame in frame_iter:
         total_frames += 1
@@ -117,6 +119,9 @@ def classify_frames(frame_iter, config: dict) -> dict:
             brightness_samples.append(mean_brightness(crop))
             center = bbox_center(cat_det.bbox)
             inside = point_in_roi(center, roi, frame.shape)
+            if cat_det.confidence > best_cat_conf:
+                best_cat_conf = cat_det.confidence
+                best_cat_frame = frame
         elif person_det:
             person_frames += 1
             max_conf = max(max_conf, person_det.confidence)
@@ -165,4 +170,5 @@ def classify_frames(frame_iter, config: dict) -> dict:
         "confidence": max_conf,
         "dwell_seconds": dwell.dwell_seconds,
         "confirmed_visit": confirmed_visit,
+        "best_frame": best_cat_frame,
     }

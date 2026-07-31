@@ -67,12 +67,18 @@ async def main() -> None:
                     dwell_seconds=result["dwell_seconds"],
                     source_clip="live",
                 )
-                logger.info("Event classified: %s", result)
+                frame = result.get("best_frame")
+                loggable = {k: v for k, v in result.items() if k != "best_frame"}
+                logger.info("Event classified: %s (photo: %s)", loggable, frame is not None)
 
                 if result["cat"] in ("white", "black"):
-                    telegram_notify.notify_visit(result["cat"], result["is_day"], result["dwell_seconds"])
+                    telegram_notify.notify_visit(
+                        result["cat"], result["is_day"], result["dwell_seconds"], frame=frame
+                    )
                 elif result["cat"] in ("white_passby", "black_passby"):
-                    telegram_notify.notify_passby(result["cat"].removesuffix("_passby"), result["is_day"])
+                    telegram_notify.notify_passby(
+                        result["cat"].removesuffix("_passby"), result["is_day"], frame=frame
+                    )
             except asyncio.CancelledError:
                 raise
             except Exception:

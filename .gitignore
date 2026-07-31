@@ -10,5 +10,6 @@ data/sample_clips/
 data/clips/
 data/thumbnails/
 data/main.log
+data/watchdog.log
 
 yolov8n.pt
