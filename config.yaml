@@ -21,7 +21,9 @@ dwell_gap_tolerance_seconds: 2.0
 # finalizing/classifying the fragment early. Observed live: one continuous cat
 # presence split into several sub-threshold "Motion started/stopped" pairs a
 # few seconds apart, each never reaching min_dwell_seconds on its own.
-motion_coalesce_gap_seconds: 3.0
+motion_coalesce_gap_seconds: 5.0
+# Raised from 3.0 -- observed live gaps between fragments of one continuous
+# cat presence around 5-8s, wider than the initial guess.
 
 # Known cosmetic issue (not fixed): dark leather furniture at the far-left frame
 # edge gets misdetected as "person" at ~0.4-0.46 confidence, which can occasionally
