@@ -118,20 +118,30 @@ async def _close(cam: ONVIFCamera, manager) -> None:
         logger.debug("cam.close() failed during teardown, ignoring", exc_info=True)
 
 
+SUBSCRIBE_BACKOFF_BASE = 5
+SUBSCRIBE_BACKOFF_MAX = 300  # cap at 5 min -- hammering a camera that's stuck
+# subscribing (e.g. it hit an internal subscription-count limit) just makes
+# things worse and never recovers on its own.
+
+
 async def watch_motion_events(host: str, port: int, user: str, password: str):
     """Async generator yielding True on motion-start and False on motion-stop.
 
     Re-subscribes from scratch after repeated PullMessages failures, since a
     stuck/stale subscription (e.g. left over from an unclean previous shutdown)
     doesn't recover by just retrying the same call."""
+    subscribe_failures = 0
     while True:
         try:
             cam, manager = await _subscribe(host, port, user, password)
+            subscribe_failures = 0
         except asyncio.CancelledError:
             raise
         except Exception:
-            logger.warning("Failed to (re)subscribe, retrying in 5s", exc_info=True)
-            await asyncio.sleep(5)
+            backoff = min(SUBSCRIBE_BACKOFF_BASE * (2**subscribe_failures), SUBSCRIBE_BACKOFF_MAX)
+            subscribe_failures += 1
+            logger.warning("Failed to (re)subscribe, retrying in %ds", backoff, exc_info=True)
+            await asyncio.sleep(backoff)
             continue
 
         service = manager.get_service()
