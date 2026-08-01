@@ -101,6 +101,8 @@ def classify_frames(frame_iter, config: dict, current_hour: int | None = None) -
     thresholds = config["thresholds"]
     gap_tolerance = config["dwell_gap_tolerance_seconds"]
     min_dwell = config["min_dwell_seconds"]
+    max_visible_density = config.get("dwell_max_visible_density", 0.65)
+    sample_interval = 1.0 / config["sample_fps"]
 
     day_votes = []
     all_brightness_samples = []
@@ -178,8 +180,22 @@ def classify_frames(frame_iter, config: dict, current_hour: int | None = None) -
 
     for ep in episodes:
         ep["dwell"] = ep["last_inside_t"] - ep["entered_at"]
+        # Fraction of the episode's span actually spent visibly detected inside
+        # the ROI. A real visit spends most of it hidden inside the enclosed
+        # dome (observed density 0.35-0.57 across known real visits) -- a cat
+        # that's just standing/rubbing right outside the box stays continuously
+        # visible instead (observed 0.80 on a known false positive). Rejecting
+        # high-density episodes here is what actually distinguishes "was inside
+        # the box" from "spent a while near it", rather than dwell time alone.
+        ep["visible_density"] = (
+            len(ep["brightness"]) * sample_interval / ep["dwell"] if ep["dwell"] > 0 else 1.0
+        )
 
-    confirmed = [ep for ep in episodes if ep["dwell"] >= min_dwell]
+    confirmed = [
+        ep
+        for ep in episodes
+        if ep["dwell"] >= min_dwell and ep["visible_density"] <= max_visible_density
+    ]
     if confirmed:
         results = []
         for ep in confirmed:

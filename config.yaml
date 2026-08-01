@@ -14,6 +14,14 @@ yolo_confidence: 0.4
 roi: [0.30, 0.05, 1.00, 0.65]
 
 min_dwell_seconds: 12
+dwell_max_visible_density: 0.65
+# Max fraction of an episode's span that may actually show a detected cat inside
+# the ROI for it to still count as a confirmed visit. A real visit is mostly
+# invisible (cat hidden inside the enclosed dome) -- calibrated real visits
+# measured 0.35-0.57. A cat that lingers/rubs right outside the box stays
+# continuously visible instead -- a known false positive measured 0.80. Without
+# this check, dwell time alone can't tell "was inside the box" from "spent a
+# while visibly near it", since both can span >min_dwell_seconds.
 dwell_gap_tolerance_seconds: 30.0
 # Raised from 2.0: this litter box is an enclosed dome, so a cat genuinely
 # inside using it is mostly invisible to the camera (only visible briefly at
