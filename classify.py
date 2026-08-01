@@ -140,40 +140,31 @@ def classify_frames(frame_iter, config: dict, current_hour: int | None = None) -
                 best_cat_frame = frame
 
         # Episode boundary: a gap since the cat was last confirmed inside the ROI
-        # longer than gap_tolerance ends the current episode. Shorter gaps don't
-        # start a new episode, but also don't themselves count as dwell time below
-        # -- only frames actually confirmed inside do (see dwell accumulation).
+        # longer than gap_tolerance ends the current episode. A shorter gap is
+        # still credited as dwell time (see below) -- this litter box is an
+        # enclosed dome, so a cat genuinely inside is invisible to the camera for
+        # most of a real visit. Only counting frames actually confirmed inside
+        # (as an earlier version of this function did) undercounts real visits
+        # to almost nothing, since very few sampled frames catch the cat visible;
+        # crediting the full entered->last-seen span is what actually lets a real
+        # visit reach min_dwell_seconds.
         if current is not None and (t - current["last_inside_t"]) > gap_tolerance:
             close_current()
 
         if inside:
             if current is None:
                 current = {
-                    "dwell": 0.0,
-                    "last_inside_t": None,
-                    "last_t": None,
+                    "entered_at": t,
+                    "last_inside_t": t,
                     "brightness": [],
                     "best_conf": 0.0,
                     "best_frame": None,
                 }
+            current["last_inside_t"] = t
             current["brightness"].append(brightness)
             if cat_det.confidence > current["best_conf"]:
                 current["best_conf"] = cat_det.confidence
                 current["best_frame"] = frame
-
-        if current is not None:
-            # Same accumulation as the original single-episode DwellTracker:
-            # each frame confirmed inside (with a recent-enough prior inside
-            # sighting) adds its own sampling interval to dwell -- so time the
-            # cat is simply not detected (e.g. genuinely inside the dome) is
-            # bridged without being counted as dwell itself.
-            if current["last_t"] is not None:
-                dt = t - current["last_t"]
-                if inside and current["last_inside_t"] is not None:
-                    current["dwell"] += dt
-            if inside:
-                current["last_inside_t"] = t
-            current["last_t"] = t
 
     close_current()
 
@@ -184,6 +175,9 @@ def classify_frames(frame_iter, config: dict, current_hour: int | None = None) -
 
     if total_frames == 0:
         return [{"cat": "unknown", "is_day": is_day, "confidence": 0.0, "dwell_seconds": 0.0}]
+
+    for ep in episodes:
+        ep["dwell"] = ep["last_inside_t"] - ep["entered_at"]
 
     confirmed = [ep for ep in episodes if ep["dwell"] >= min_dwell]
     if confirmed:
