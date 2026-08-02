@@ -32,6 +32,12 @@ PRE_ROLL_SECONDS = 2.0  # keep this much recent video buffered at all times, so 
 # motion event that's already brief by the time ONVIF tells us doesn't also lose
 # its first couple of seconds to RTSP connection setup latency.
 RECONNECT_BACKOFF = 2.0
+RTSP_OPEN_TIMEOUT_MS = 10_000  # cv2.VideoCapture() has no timeout by default --
+# confirmed live to hang the reader thread indefinitely during a network blip
+# (Wi-Fi hiccup on the camera's side left the TCP connect() attempt stuck for
+# minutes with no error and no retry, since nothing ever raised). Setting an
+# explicit open/read timeout turns that into a normal reconnect-loop failure.
+RTSP_READ_TIMEOUT_MS = 10_000
 
 
 class MotionCapture:
@@ -64,7 +70,10 @@ class MotionCapture:
     def _run(self) -> None:
         min_interval = 1.0 / self.sample_fps
         while not self._stop_reader.is_set():
-            cap = cv2.VideoCapture(self.rtsp_url)
+            cap = cv2.VideoCapture()
+            cap.set(cv2.CAP_PROP_OPEN_TIMEOUT_MSEC, RTSP_OPEN_TIMEOUT_MS)
+            cap.set(cv2.CAP_PROP_READ_TIMEOUT_MSEC, RTSP_READ_TIMEOUT_MS)
+            cap.open(self.rtsp_url)
             if not cap.isOpened():
                 logger.error("Failed to open RTSP stream at %s, retrying in %ss", self.rtsp_url, RECONNECT_BACKOFF)
                 cap.release()
