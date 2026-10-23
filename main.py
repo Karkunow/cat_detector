@@ -7,6 +7,7 @@ import signal
 from datetime import datetime
 from pathlib import Path
 
+import cv2
 import yaml
 from dotenv import load_dotenv
 from urllib.parse import quote
@@ -25,6 +26,20 @@ logger = logging.getLogger(__name__)
 def load_config() -> dict:
     with open(CONFIG_PATH) as f:
         return yaml.safe_load(f)
+
+
+def save_event_frames(frames, now, count: int = 4, keep_days: int = 14) -> None:
+    """Кожна подія камери лишає кілька рівномірних кадрів у data/frames/events (навіть без кота в кадрі) —
+    для калібрування: кіт у барабані YOLO не бачить, а вікно/фасад по кадру видно. Старші за keep_days днів чистимо."""
+    out = Path(__file__).parent / "data" / "frames" / "events"
+    out.mkdir(parents=True, exist_ok=True)
+    n = len(frames)
+    for i in sorted({int(k * (n - 1) / max(count - 1, 1)) for k in range(count)}):
+        cv2.imwrite(str(out / f"{now:%Y%m%d-%H%M%S}-{i:03d}.jpg"), frames[i][1])
+    cutoff = now.timestamp() - keep_days * 86400
+    for old in out.glob("*.jpg"):
+        if old.stat().st_mtime < cutoff:
+            old.unlink()
 
 
 async def main() -> None:
@@ -62,6 +77,7 @@ async def main() -> None:
 
         try:
             now = datetime.now()
+            save_event_frames(frames, now)
             results = await asyncio.to_thread(classify_frames, frames, config, now.hour)
             timestamp = now.isoformat()
             for result in results:
@@ -75,6 +91,10 @@ async def main() -> None:
                     source_clip="live",
                 )
                 frame = result.get("best_frame")
+                if frame is not None:  # кадри лишаємо для калібрування порогів білий/чорний
+                    frames_dir = Path(__file__).parent / "data" / "frames"
+                    frames_dir.mkdir(parents=True, exist_ok=True)
+                    cv2.imwrite(str(frames_dir / f"{now:%Y%m%d-%H%M%S}-{result['cat']}.jpg"), frame)
                 loggable = {k: v for k, v in result.items() if k != "best_frame"}
                 logger.info("Event classified: %s (photo: %s)", loggable, frame is not None)
 

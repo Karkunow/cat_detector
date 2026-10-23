@@ -57,14 +57,28 @@ def send_photo(frame, caption: str, token: str | None = None, chat_id: str | Non
     )
 
 
+def _recipients() -> list[str]:
+    """Основний чат + додаткові (TELEGRAM_EXTRA_CHAT_IDS через кому) — лише для сповіщень про візити/проходи."""
+    extra = [c.strip() for c in os.environ.get("TELEGRAM_EXTRA_CHAT_IDS", "").split(",") if c.strip()]
+    return [os.environ["TELEGRAM_CHAT_ID"], *extra]
+
+
 def _notify(text: str, frame) -> None:
+    for chat_id in _recipients():
+        try:
+            _notify_one(text, frame, chat_id)
+        except requests.RequestException:
+            logger.exception("Failed to notify chat %s, continuing with the others", chat_id)
+
+
+def _notify_one(text: str, frame, chat_id: str) -> None:
     if frame is not None:
         try:
-            send_photo(frame, text)
+            send_photo(frame, text, chat_id=chat_id)
             return
         except requests.RequestException:
             logger.exception("Failed to send Telegram photo, falling back to text-only")
-    send_message(text)
+    send_message(text, chat_id=chat_id)
 
 
 def notify_visit(cat: str, is_day: bool, dwell_seconds: float, frame=None) -> None:

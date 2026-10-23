@@ -13,3 +13,6 @@ data/main.log
 data/watchdog.log
 
 yolov8n.pt
+data/frames/
+run.log
+install.log

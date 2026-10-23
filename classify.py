@@ -1,3 +1,4 @@
+import logging
 import statistics
 
 import cv2
@@ -18,11 +19,47 @@ def is_day_frame(frame, sat_threshold: float = DAY_SATURATION_THRESHOLD) -> bool
     return mean_sat >= sat_threshold
 
 
+def color_spread(frame) -> float:
+    """Mean |B-G|+|G-R|. IR night frames from the camera are near-gray (spread ~0),
+    even when the wall clock still says day; a lit room has noticeably more."""
+    f = frame.astype(np.int16)
+    return float(np.mean(np.abs(f[:, :, 0] - f[:, :, 1]) + np.abs(f[:, :, 1] - f[:, :, 2])))
+
+
+IR_SPREAD_THRESHOLD = 4.0
+IR_DAY_WALL_MIN = 112  # у нічному ІЧ «стіна» ~98, у сірому денному кадрі >120
+IR_DAY_THRESHOLDS = {"white_min": 0.55, "black_max": 0.50}  # 25-й перцентиль кота / фасад (медіана по подіях). Вночі: чорний 0.30–0.38, білий 0.54–0.66; вдень (відео 22.10): чорний 0.46–0.48, білий 0.62–0.85
+
+
+def wall_and_front(frame) -> tuple[float, float]:
+    """Яскравість стіни зліва і білого фасаду лотка (фіксовані ділянки кадру 1280x720)."""
+    g = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+    h, w = g.shape
+    wall = float(np.mean(g[int(.42 * h):int(.64 * h), int(.016 * w):int(.125 * w)]))
+    front = float(np.mean(g[int(.69 * h):int(.78 * h), int(.18 * w):int(.47 * w)]))
+    return wall, front
+
+
+def classify_ir_day(brightness: float, front: float) -> str:
+    """Сірий денний режим: абсолютні нічні пороги тут дають «білий → чорний», тож міряємо відносно фасаду."""
+    r = brightness / max(front, 1.0)
+    if r >= IR_DAY_THRESHOLDS["white_min"]:
+        return "white"
+    if r <= IR_DAY_THRESHOLDS["black_max"]:
+        return "black"
+    return "unknown"
+
+
 def is_day_time(hour: int, day_start_hour: int = 7, day_end_hour: int = 21) -> bool:
     """Wall-clock day/night check. Coarse (fixed hours, no actual sunrise/sunset
     calculation) but far more reliable than image saturation for scenes that are
     mostly white/gray regardless of lighting."""
     return day_start_hour <= hour < day_end_hour
+
+
+def is_day_time_color(spreads: list[float]) -> bool:
+    """Кадри кольорові (камера не в ІЧ)."""
+    return bool(spreads) and statistics.median(spreads) >= IR_SPREAD_THRESHOLD
 
 
 def crop_bbox(frame, bbox: tuple[int, int, int, int]):
@@ -31,6 +68,13 @@ def crop_bbox(frame, bbox: tuple[int, int, int, int]):
     x1, x2 = max(0, x1), min(w, x2)
     y1, y2 = max(0, y1), min(h, y2)
     return frame[y1:y2, x1:x2]
+
+
+def dark_brightness(crop) -> float:
+    """25-й перцентиль сірого в рамці кота: чорний кіт лишається темним, навіть коли рамка захопила білий фасад лотка."""
+    if crop.size == 0:
+        return 0.0
+    return float(np.percentile(cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY), 25))
 
 
 def mean_brightness(crop) -> float:
@@ -63,10 +107,27 @@ def point_in_roi(point: tuple[float, float], roi: list[float], frame_shape: tupl
     return x1 <= px <= x2 and y1 <= py <= y2
 
 
-def best_detection(detections: list[Detection], label: str) -> Detection | None:
+DRUM_WINDOW = (0.24, 0.22, 0.39, 0.50)  # вікно барабана, частки кадру 1280x720 (як у petbox-safe-clean)
+
+
+def _overlap(bbox: tuple[int, int, int, int], frame_shape) -> float:
+    h, w = frame_shape[:2]
+    x1, y1, x2, y2 = bbox
+    wx1, wy1, wx2, wy2 = DRUM_WINDOW[0] * w, DRUM_WINDOW[1] * h, DRUM_WINDOW[2] * w, DRUM_WINDOW[3] * h
+    ix, iy = min(x2, wx2) - max(x1, wx1), min(y2, wy2) - max(y1, wy1)
+    return max(ix, 0) * max(iy, 0) / ((wx2 - wx1) * (wy2 - wy1))
+
+
+def best_detection(detections: list[Detection], label: str, frame_shape=None) -> Detection | None:
+    """Найвпевненіший кіт. Якщо в кадрі їх кілька, береться той, що перекриває вікно барабана (22.10 16:22: чорний
+    стояв ближче до об'єктива, а у барабан заходив білий — найвпевненішим був чорний)."""
     candidates = [d for d in detections if d.label == label]
     if not candidates:
         return None
+    if frame_shape is not None and len(candidates) > 1:
+        at_drum = [d for d in candidates if _overlap(d.bbox, frame_shape) >= 0.25]
+        if at_drum:
+            return max(at_drum, key=lambda d: _overlap(d.bbox, frame_shape))
     return max(candidates, key=lambda d: d.confidence)
 
 
@@ -105,6 +166,9 @@ def classify_frames(frame_iter, config: dict, current_hour: int | None = None) -
     sample_interval = 1.0 / config["sample_fps"]
 
     day_votes = []
+    spreads = []
+    walls = []
+    fronts = []
     all_brightness_samples = []
     cat_frames = 0
     total_frames = 0
@@ -125,15 +189,21 @@ def classify_frames(frame_iter, config: dict, current_hour: int | None = None) -
         total_frames += 1
         if current_hour is None:
             day_votes.append(is_day_frame(frame))
+        else:
+            spreads.append(color_spread(frame))
+            wl, fr = wall_and_front(frame)
+            walls.append(wl)
+            fronts.append(fr)
         dets = detect(frame, config["yolo_confidence"])
-        cat_det = best_detection(dets, "cat")
+        cat_det = best_detection(dets, "cat", frame.shape)
 
         inside = False
         if cat_det:
             cat_frames += 1
             max_conf = max(max_conf, cat_det.confidence)
             crop = crop_bbox(frame, cat_det.bbox)
-            brightness = mean_brightness(crop)
+            ir_frame = current_hour is not None and bool(spreads) and spreads[-1] < IR_SPREAD_THRESHOLD
+            brightness = dark_brightness(crop) if ir_frame else mean_brightness(crop)
             all_brightness_samples.append(brightness)
             center = bbox_center(cat_det.bbox)
             inside = point_in_roi(center, roi, frame.shape)
@@ -172,8 +242,26 @@ def classify_frames(frame_iter, config: dict, current_hour: int | None = None) -
 
     if current_hour is not None:
         is_day = is_day_time(current_hour)
+        if spreads:
+            med = statistics.median(spreads)
+            logging.getLogger(__name__).info(f"color_spread median={med:.1f} (IR < {IR_SPREAD_THRESHOLD})")
+            if med < IR_SPREAD_THRESHOLD:
+                is_day = False  # камера в ІЧ-режимі — це ніч, хоч би що казав годинник
     else:
         is_day = (sum(day_votes) / len(day_votes)) >= 0.5 if day_votes else True
+
+    # у будь-якому ІЧ-кадрі (день чи ніч) міряємо відносно фасаду: абсолютна яскравість кота плаває 140–160 і ловить «unknown»
+    ir_day = bool(walls) and not is_day_time_color(spreads)
+    front = statistics.median(fronts) if fronts else 0.0
+    if ir_day:
+        logging.getLogger(__name__).info(f"сірий денний ІЧ-режим: wall={statistics.median(walls):.0f}, фасад={front:.0f}")
+
+    def label_color(brightness: float) -> str:
+        color = classify_ir_day(brightness, front) if ir_day else classify_cat_color(brightness, is_day, thresholds)
+        logging.getLogger(__name__).info(
+            f"яскравість кота {brightness:.0f} (фасад {front:.0f}, відношення {brightness / max(front, 1.0):.2f}, ir_day={ir_day}) -> {color}"
+        )
+        return color
 
     if total_frames == 0:
         return [{"cat": "unknown", "is_day": is_day, "confidence": 0.0, "dwell_seconds": 0.0}]
@@ -200,7 +288,7 @@ def classify_frames(frame_iter, config: dict, current_hour: int | None = None) -
         results = []
         for ep in confirmed:
             brightness = statistics.median(ep["brightness"])
-            label = classify_cat_color(brightness, is_day, thresholds)
+            label = label_color(brightness)
             results.append(
                 {
                     "cat": label,
@@ -229,7 +317,7 @@ def classify_frames(frame_iter, config: dict, current_hour: int | None = None) -
     # "passed by" notification can be sent.
     best_dwell = max((ep["dwell"] for ep in episodes), default=0.0)
     brightness = statistics.median(all_brightness_samples)
-    color = classify_cat_color(brightness, is_day, thresholds)
+    color = label_color(brightness)
     label = f"{color}_passby" if color != "unknown" else "pass_through"
     return [
         {
