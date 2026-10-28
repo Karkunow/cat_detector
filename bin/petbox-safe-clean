@@ -463,16 +463,32 @@ def dry_run():
     with open(QUESTIONS, "a") as f:   # відповісти «так/ні» можна на будь-яке фото, і на нічне теж
         f.write(json.dumps({"message_id": mid, "ts": int(time.time()), "verdict": "busy" if verdict else "clean",
                             "why": "; ".join(verdict), "frame": frame_path, "asked": not NO_QUESTION}) + "\n")
-    shadow_log(frame_path, "block" if verdict else "allow", "; ".join(verdict))
+    shadow_log(frame_path, "block" if verdict else "allow", "; ".join(verdict), mid)
 
-def shadow_log(frame_path, current, reason):
-    """Тіньовий режим litter_algo: ПІСЛЯ рішення фоном дописує вердикт алгоритму в ~/cat_detector/data/litter_shadow.jsonl.
-    Нічого не чистить, не блокує і не пише в Telegram; будь-який збій ковтається, відповідь не читається."""
+SHADOW_LOG = f"{HOME}/cat_detector/data/litter_shadow.jsonl"
+SHADOW_CLASS = {"clear": "clear ✅ (порожньо, чистити можна)", "near": "near ⚠️ (вікно порожнє, але корпус чимось закритий)",
+                "inside": "inside 🐱 (кіт у барабані)", "blocking": "blocking 🚫 (кіт/людина перекриває вхід)",
+                "unknown": "unknown ❓ (лоток не знайдено)", "error": "error ⚠️ (збій алгоритму)"}
+SHADOW_AGREE = {"agree": "згодні", "algo_stricter": "algo СУВОРІШИЙ (чинна дозволила, algo блокує)",
+                "algo_looser": "algo М'ЯКШИЙ (чинна заблокувала, algo дозволяє)", "no_current": "порівняти нема з чим"}
+
+def shadow_log(frame_path, current, reason, mid):
+    """Тіньовий режим litter_algo: ПІСЛЯ рішення рахує вердикт алгоритму, дописує його в data/litter_shadow.jsonl і
+    шле відповіддю на фото. Нічого не чистить і не блокує; будь-який збій ковтається, рішення назад не читається."""
     try:
-        subprocess.Popen(["timeout", "20", sys.executable, "-m", "litter_algo.shadow", "--frame", frame_path,
-                          "--current", current, "--reason", reason, "--source", "petbox-safe-clean-dry-run"],
-                         cwd=f"{HOME}/cat_detector", stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
-                         stderr=subprocess.DEVNULL, start_new_session=True)
+        subprocess.run([sys.executable, "-m", "litter_algo.shadow", "--frame", frame_path, "--current", current,
+                        "--reason", reason, "--source", "petbox-safe-clean-dry-run"], cwd=f"{HOME}/cat_detector",
+                       stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=20)
+        rec = json.loads(open(SHADOW_LOG, encoding="utf-8").readlines()[-1])
+        if rec.get("frame") != frame_path:
+            return
+        nums = f" f={rec['f']:.2f} g={rec['g']:.2f}, пошук лотка {rec['score']:.2f}" if rec.get("f") is not None else ""
+        text = (f"🔬 litter_algo (тінь): {SHADOW_CLASS.get(rec.get('algo'), rec.get('algo'))}{nums}\n"
+                f"Чинна логіка: {'чистила б' if current == 'allow' else 'не чистила б'}, {SHADOW_AGREE.get(rec.get('agreement'), '')}")
+        env = dict(l.strip().split("=", 1) for l in open(CAM_ENV) if "=" in l and not l.startswith("#"))
+        data = json.dumps({"chat_id": env["TELEGRAM_CHAT_ID"], "text": text, "reply_to_message_id": mid}).encode()
+        urllib.request.urlopen(urllib.request.Request(f"https://api.telegram.org/bot{env['TELEGRAM_BOT_TOKEN']}/sendMessage",
+                               data=data, headers={"Content-Type": "application/json"}), timeout=20)
     except Exception:
         pass
 
