@@ -1,0 +1,255 @@
+#!/home/slava/cat_detector/.venv/bin/python
+# Автоочищення лотка Furbulous з усіма запобіжниками (служба petbox-autoclean).
+# Логіка: після візиту кота (подія в events.db, не «повз») чекаємо QUIET_MIN хв повної тиші
+# (жодних подій камери, руху, запису SD), потім ті самі перевірки, що в petbox-safe-clean (busy_reason:
+# рух, положення камери, запис SD, workstatus, YOLO, вікно барабана), і лише тоді — petbox clean.
+# Фото в Telegram: до (перед рішенням), на старті (знімається перед командою запуску й зберігається на диск), після очищення. Будь-яка помилка/невідомість = не чистимо.
+# Налаштування: ~/.config/petbox-autoclean.conf (рядки KEY=значення), читається щоцикл, перезапуск не потрібен.
+#   ENABLED=1            0 — нічого не чистити (служба працює вхолосту)
+#   QUIET_MIN=15         хвилин тиші після останньої події/руху
+#   BAN=02:00-10:00      заборона запуску за часом Лісабона; порожньо (BAN=) — нічні чистки дозволені
+#   MIN_GAP_MIN=60       мінімум хвилин між очищеннями
+#   MAX_PER_DAY=6        ліміт очищень за добу
+# Використання: petbox-autoclean            (служба, цикл)
+#               petbox-autoclean --dry-run [--once] [--assume-dirty]   (нічого не чистить і не шле в Telegram)
+import importlib.machinery, importlib.util, json, os, sqlite3, subprocess, sys, time
+from datetime import datetime, timedelta
+from zoneinfo import ZoneInfo
+
+HOME = os.path.expanduser("~")
+CONF = f"{HOME}/.config/petbox-autoclean.conf"
+STATE = f"{HOME}/.cache/petbox-autoclean.json"
+DRY = "--dry-run" in sys.argv
+ONCE = "--once" in sys.argv
+ASSUME_DIRTY = "--assume-dirty" in sys.argv
+LOOP_SEC = 60
+CLEAN_MARGIN_MIN = 15      # цикл не має заходити у заборонене вікно
+DONE_LIMIT = 900           # с очікування кінця циклу
+TZ = ZoneInfo("Europe/Lisbon")
+DEFAULTS = {"ENABLED": "1", "QUIET_MIN": "15", "BAN": "02:00-10:00", "MIN_GAP_MIN": "60", "MAX_PER_DAY": "6"}
+
+_loader = importlib.machinery.SourceFileLoader("psc", f"{HOME}/bin/petbox-safe-clean")
+psc = importlib.util.module_from_spec(importlib.util.spec_from_loader("psc", _loader))
+_loader.exec_module(psc)
+log = psc.log
+
+def conf():
+    c = dict(DEFAULTS)
+    try:
+        for l in open(CONF):
+            l = l.split("#", 1)[0].strip()
+            if "=" in l:
+                k, v = l.split("=", 1)
+                c[k.strip()] = v.strip()
+    except FileNotFoundError:
+        pass
+    return c
+
+def in_ban(ban, when):
+    """True, якщо момент `when` (Лісабон) потрапляє у вікно HH:MM-HH:MM. Нерозбірливе вікно = заборона (fail-closed)."""
+    if not ban:
+        return False
+    try:
+        a, b = ban.split("-")
+        t = when.hour * 60 + when.minute
+        s = int(a[:2]) * 60 + int(a[3:5])
+        e = int(b[:2]) * 60 + int(b[3:5])
+    except Exception:
+        return True
+    return s <= t < e if s <= e else (t >= s or t < e)
+
+def load_state():
+    try:
+        return json.load(open(STATE))
+    except Exception:
+        return None
+
+def save_state(st):
+    os.makedirs(os.path.dirname(STATE), exist_ok=True)
+    json.dump(st, open(STATE, "w"))
+
+def last_events():
+    """(ts останньої події будь-якого типу, ts останньої події-візиту) у секундах epoch; None, якщо нема."""
+    db = sqlite3.connect(f"file:{psc.EVENTS_DB}?mode=ro", uri=True)
+    def ts(sql):
+        r = db.execute(sql).fetchone()
+        return datetime.fromisoformat(r[0]).timestamp() if r else None   # timestamp у events.db — локальний час (Лісабон)
+    anyev = ts("select timestamp from events order by id desc limit 1")
+    visit = ts("select timestamp from events where cat not like '%passby%' and cat != 'pass_through' order by id desc limit 1")
+    return anyev, visit
+
+def tg_env():
+    return dict(l.strip().split("=", 1) for l in open(psc.CAM_ENV) if "=" in l and not l.startswith("#"))
+
+def photo(frame, caption):
+    if DRY:
+        log(f"[dry-run] фото в Telegram не шлемо: {caption.splitlines()[0]}")
+        return True
+    try:
+        psc.telegram_photo(frame, caption)
+        return True
+    except Exception as e:
+        log(f"Telegram: фото не надіслано ({e})")
+        return False
+
+def fresh_frame():
+    fr = psc.grab_frames(1)
+    return fr[-1] if fr else None
+
+def save_start_frame(frame):
+    """Зберігає кадр перед стартом у ~/petbox-autoclean-frames; шлях або None (збій запису не блокує очищення)."""
+    try:
+        d = f"{HOME}/petbox-autoclean-frames"
+        os.makedirs(d, exist_ok=True)
+        path = f"{d}/{time.strftime('%Y%m%d-%H%M%S')}-start.jpg"
+        return path if psc.cv2.imwrite(path, frame) else None
+    except Exception as e:
+        log(f"кадр перед стартом не збережено на диск ({e})")
+        return None
+
+def eligible(c, st, now):
+    """Причина, чому зараз НЕ чистимо (рядок), або None. Лише дешеві перевірки, без камери."""
+    if c["ENABLED"] != "1":
+        return "вимкнено (ENABLED=0)"
+    when = datetime.fromtimestamp(now, TZ)
+    if in_ban(c["BAN"], when) or in_ban(c["BAN"], when + timedelta(minutes=CLEAN_MARGIN_MIN)):
+        return f"заборонене вікно {c['BAN']} (Лісабон)"
+    try:
+        anyev, visit = last_events()
+    except Exception as e:
+        return f"events.db недоступна ({e})"
+    if not ASSUME_DIRTY and not (visit and visit > st["last_clean_ts"]):
+        return "після останнього очищення візитів не було"
+    quiet = float(c["QUIET_MIN"]) * 60
+    last_act = max(anyev or 0, visit or 0)
+    if now - last_act < quiet:
+        return f"остання подія {(now - last_act) / 60:.0f} хв тому, чекаємо {c['QUIET_MIN']} хв тиші"
+    why = psc.motion_gate()
+    if why:
+        return why
+    try:
+        if now - json.load(open(psc.MOTION_STATE))["last_motion_ts"] < quiet:
+            return f"рух за останні {c['QUIET_MIN']} хв"
+    except Exception as e:
+        return f"стан руху недоступний ({e})"
+    if now - st["last_clean_ts"] < float(c["MIN_GAP_MIN"]) * 60:
+        return f"від минулого очищення менше {c['MIN_GAP_MIN']} хв"
+    if now < st.get("backoff_until", 0):
+        return "пауза після невдалого запуску"
+    day = time.strftime("%F", time.localtime(now))
+    if sum(1 for t in st.get("cleans", []) if time.strftime("%F", time.localtime(t)) == day) >= int(c["MAX_PER_DAY"]):
+        return f"ліміт {c['MAX_PER_DAY']} очищень за добу"
+    return None
+
+def wait_done(started):
+    zeros = 0
+    while time.time() - started < DONE_LIMIT:
+        time.sleep(10)
+        try:
+            ws = psc.petbox_status()["workstatus"]["value"]
+        except Exception:
+            continue
+        zeros = zeros + 1 if ws == 0 else 0
+        if zeros >= 2:
+            return True
+    return False
+
+DOUBT_GAP_SEC = 3600   # не частіше разу на годину
+
+def notify_doubt(st, reason):
+    """litter_algo сумнівається: не чистимо, шлемо фото й підказку. Чистка лише після твого «почисти все одно» у боті.
+    Збій повідомлення нічого не змінює: чистка й так заблокована."""
+    try:
+        now = time.time()
+        if now - st.get("last_doubt_ts", 0) < DOUBT_GAP_SEC:
+            return
+        frame = fresh_frame()
+        if frame is None:
+            return
+        st["last_doubt_ts"] = now
+        save_state(st)
+        photo(frame, f"🧹 Автоочищення НЕ запускаю: {reason}.\nЯкщо кота точно нема, напиши боту «почисти все одно».")
+    except Exception as e:
+        log(f"сумнів litter_algo: повідомлення не надіслано ({e})")
+
+def run_clean(c, st):
+    """Повна послідовність: остаточні перевірки → фото «до» → ще раз перевірки → clean → фото «старт» → чекаємо → фото «після»."""
+    reason = psc.busy_reason()
+    if reason:
+        if psc.is_algo_doubt(reason):
+            notify_doubt(st, reason)
+        return f"не чистимо: {reason}"
+    frame = fresh_frame()
+    if frame is None:
+        return "не чистимо: камера не віддала кадр для фото"
+    if not photo(frame, "🧹 Автоочищення: перевірки пройдені, збираюсь чистити (фото ДО)"):
+        return "не чистимо: фото «до» не надіслано в Telegram"
+    reason = psc.busy_reason()          # друга перевірка вже після фото
+    if reason:
+        photo(frame, f"🧹 Передумав: {reason}")
+        return f"не чистимо після фото: {reason}"
+    if DRY:
+        return "[dry-run] ЧИСТИВ БИ зараз (petbox clean не викликаємо)"
+    # Кадр «на старті» знімаємо ТУТ, перед командою, і одразу зберігаємо на диск. Раніше його знімали після
+    # petbox clean + 20 с очікування, тож на фото лоток уже чистився. У Telegram кадр іде лише після старту,
+    # щоб відправка (до 20 с) не затримувала команду.
+    start_frame = fresh_frame()
+    if start_frame is None:
+        return "не чистимо: камера не віддала кадр перед стартом"
+    start_path = save_start_frame(start_frame)
+    log(f"кадр перед стартом знято{f' і збережено: {start_path}' if start_path else ''}")
+    now = time.time()
+    st["last_clean_ts"] = now
+    st.setdefault("cleans", []).append(now)
+    st["cleans"] = st["cleans"][-50:]
+    save_state(st)                       # фіксуємо до команди: збій далі не призведе до повторів
+    subprocess.run([f"{HOME}/bin/petbox", "clean"], capture_output=True, timeout=60)
+    time.sleep(20)
+    ws = psc.petbox_status()["workstatus"]["value"]
+    f2 = fresh_frame()
+    if ws != 1:
+        st["backoff_until"] = time.time() + 1800
+        save_state(st)
+        psc.notify(f"Автоочищення: команду відправлено, але цикл не почався (workstatus={ws})")
+        if f2 is not None:
+            photo(f2, f"⚠️ Автоочищення: цикл не почався (workstatus={ws})")
+        return f"команда відправлена, цикл не почався (workstatus={ws})"
+    photo(start_frame, "▶️ Автоочищення: цикл почався (фото НА СТАРТІ: знято перед командою запуску)")
+    ok = wait_done(now)
+    f3 = fresh_frame()
+    cap = (f"✅ Автоочищення закінчилось (~{(time.time() - now) / 60:.0f} хв), фото ПІСЛЯ" if ok
+           else "⚠️ Автоочищення триває понад 15 хв або лоток завис, перевір сам (фото зараз)")
+    if f3 is not None:
+        photo(f3, cap)
+    else:
+        psc.notify(cap)
+    return "очищення виконано" if ok else "очищення не завершилось за 15 хв"
+
+def main():
+    log(f"petbox-autoclean запущено{' (dry-run)' if DRY else ''}")
+    st = load_state()
+    if not st:
+        st = {"last_clean_ts": 0 if DRY else time.time(), "cleans": []}   # перший старт: лічимо чистим «зараз», чистимо лише після нових візитів
+        if not DRY:
+            save_state(st)
+    last_msg = None
+    while True:
+        msg = None
+        try:
+            c = conf()
+            st = load_state() or st
+            msg = eligible(c, st, time.time())
+            if msg is None:
+                msg = run_clean(c, st)
+                st = load_state() or st
+        except Exception as e:
+            msg = f"помилка ({type(e).__name__}: {e}), не чистимо"
+        if msg != last_msg or ONCE:
+            log(f"autoclean: {msg}")
+            last_msg = msg
+        if ONCE:
+            return
+        time.sleep(LOOP_SEC)
+
+if __name__ == "__main__":
+    main()

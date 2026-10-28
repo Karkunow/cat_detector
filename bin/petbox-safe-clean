@@ -253,6 +253,49 @@ def drum_ncc_gate(frames):
         log("NCC-перевірка барабана: для частини кадрів нема еталона режиму")
     return None
 
+ALGO_VETO = True       # вето litter_algo (28.10.2026): чистимо лише коли кожен кадр має клас clear; False — вимкнути вето
+ALGO_DOUBT = ("near", "unknown", "error")   # сумнів: вікно порожнє, але корпус закритий / лоток не знайдено / збій; inside і blocking — тверда відмова
+ALGO_TEXT = {"inside": "кіт у барабані", "blocking": "кіт або людина перекриває вхід", "near": "корпус лотка чимось закритий",
+             "unknown": "лоток не знайдено на кадрі", "error": "збій алгоритму"}
+_ALGO_LOC = None
+
+def algo_classes(frames):
+    """Класи litter_algo для кадрів. Будь-який збій (немає cv2, битий кадр) дає 'error', тобто відмову, а не дозвіл."""
+    global _ALGO_LOC
+    try:
+        from litter_algo.classify import decide, verdict
+        from litter_algo.locate import Locator
+        if _ALGO_LOC is None:
+            _ALGO_LOC = Locator()
+    except Exception as e:
+        log(f"litter_algo недоступний ({type(e).__name__}: {e}), відмова")
+        return ["error"] * len(frames)
+    out = []
+    for f in frames:
+        try:
+            a = _ALGO_LOC.analyze(f)
+            wv, _, _ = verdict(a)
+            out.append(decide(wv, a["cells"], a["rim"]))
+        except Exception as e:
+            log(f"litter_algo: збій на кадрі ({type(e).__name__}: {e})")
+            out.append("error")
+    return out
+
+def algo_gate(frames):
+    """Вето: причина відмови, якщо хоч один кадр не clear, інакше None. Може лише додати відмову, дозволити нічого не може."""
+    if not ALGO_VETO:
+        return None
+    bad = [c for c in algo_classes(frames) if c != "clear"]
+    if not bad:
+        return None
+    worst = next((c for c in ("inside", "blocking", "unknown", "near", "error") if c in bad), "error")
+    if worst in ALGO_DOUBT:
+        return f"litter_algo сумнівається ({worst}: {ALGO_TEXT[worst]})"
+    return f"litter_algo: {worst} ({ALGO_TEXT[worst]})"
+
+def is_algo_doubt(reason):
+    return bool(reason) and reason.startswith("litter_algo сумнівається")
+
 def busy_reason():
     """Повертає причину, чому зараз не можна чистити, або None, якщо все чисто."""
     why = motion_gate()
@@ -282,6 +325,9 @@ def busy_reason():
     if not frames:
         return "не вдалося отримати кадр з камери"
     why = drum_ncc_gate(frames)
+    if why:
+        return why
+    why = algo_gate(frames)
     if why:
         return why
     from detect import detect
