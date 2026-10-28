@@ -13,3 +13,4 @@ data/main.log
 data/watchdog.log
 
 yolov8n.pt
+data/litter_shadow.jsonl
