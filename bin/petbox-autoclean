@@ -75,9 +75,7 @@ def last_events():
         r = db.execute(sql).fetchone()
         return datetime.fromisoformat(r[0]).timestamp() if r else None   # timestamp у events.db — локальний час (Лісабон)
     anyev = ts("select timestamp from events order by id desc limit 1")
-    # 'unknown' — подія без кадру з котом: детектор про неї мовчить (фото в Telegram нема), тож чистити за нею не можна.
-    # Так 28.10 о 20:28 чистка пішла за unknown-подією 20:11 без жодного фото візиту; ще одна unknown-подія з'явилась о 20:29 посеред самого циклу.
-    visit = ts("select timestamp from events where cat not like '%passby%' and cat not in ('pass_through', 'unknown') order by id desc limit 1")
+    visit = ts("select timestamp from events where cat not like '%passby%' and cat != 'pass_through' order by id desc limit 1")
     return anyev, visit
 
 def tg_env():
