@@ -47,16 +47,28 @@ def cleanup_event_frames(now_ts: float, keep_days: int = 3) -> None:
             shutil.rmtree(old) if old.is_dir() else old.unlink()
 
 
-def save_event_frames(frames, now, step: int = 2) -> None:
+def save_event_frames(frames, now, step: int = 2, pre=()) -> Path:
     """Кожна подія камери лишає кожен step-й кадр (і останній) у data/frames/events/<мітка>/<індекс>.jpg (навіть без кота
-    в кадрі) — для калібрування й тестів: кіт у барабані YOLO не бачить. t кадру = індекс / sample_fps. Старе чистимо раз на добу."""
+    в кадрі) — для калібрування й тестів: кіт у барабані YOLO не бачить. t кадру = індекс / sample_fps. Кадри за ~10 с ДО події
+    (pre, не класифікуються) лежать поряд у pre/<індекс>.jpg. Старе чистимо раз на добу. Повертає теку події."""
     out = EVENTS_DIR / f"{now:%Y%m%d-%H%M%S}"
     out.mkdir(parents=True, exist_ok=True)
     n = len(frames)
     for i in sorted(set(range(0, n, step)) | {n - 1}):
         cv2.imwrite(str(out / f"{i:03d}.jpg"), frames[i][1])
+    save_context_frames(out / "pre", pre, step)
     if now.timestamp() - last_cleanup >= 86400:
         cleanup_event_frames(now.timestamp())
+    return out
+
+
+def save_context_frames(out: Path, frames, step: int = 2) -> None:
+    """Кадри поза подією (pre/ або post/ у теці події): кожен step-й, від старого до нового."""
+    if not frames:
+        return
+    out.mkdir(parents=True, exist_ok=True)
+    for i in range(0, len(frames), step):
+        cv2.imwrite(str(out / f"{i:03d}.jpg"), frames[i])
 
 
 async def main() -> None:
@@ -220,6 +232,17 @@ async def main() -> None:
         except Exception:
             logger.exception("Inside recheck failed")
 
+    async def save_post_context(event_dir: Path, event_end: float) -> None:
+        """Кадри за ~context_seconds ПІСЛЯ події: чекаємо, поки вони накопичаться в буфері, і пишемо в <подія>/post/."""
+        try:
+            await asyncio.sleep(grabber.context_seconds + 0.5)
+            post = grabber.post_context(event_end)
+            await asyncio.to_thread(save_context_frames, event_dir / "post", post)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception("Failed to save post-event context frames")
+
     async def finalize_event() -> None:
         nonlocal capturing, finalize_task, inside_since, last_visit, processing
         try:
@@ -228,6 +251,8 @@ async def main() -> None:
             return
 
         frames = grabber.stop_event()
+        pre_frames = grabber.pre_context()
+        event_end = grabber.last_event_end()
         capturing = False
         finalize_task = None
         logger.info("Motion event finalized, %d frames captured", len(frames))
@@ -237,7 +262,9 @@ async def main() -> None:
         processing = True
         try:
             now = datetime.now()
-            save_event_frames(frames, now)
+            event_dir = save_event_frames(frames, now, pre=pre_frames)
+            if event_end is not None:
+                asyncio.create_task(save_post_context(event_dir, event_end))
             results = await asyncio.to_thread(classify_frames, frames, config, now.hour)
             human = await asyncio.to_thread(person_present, [f for _, f in frames])
             timestamp = now.isoformat()

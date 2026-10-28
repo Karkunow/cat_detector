@@ -29,9 +29,11 @@ PULL_TIMEOUT = "PT5S"  # ONVIF duration: block up to 5s per PullMessages call.
 MAX_EVENT_SECONDS = 120  # safety cap so a stuck "motion=true" can't capture forever
 
 
-PRE_ROLL_SECONDS = 2.0  # keep this much recent video buffered at all times, so a
-# motion event that's already brief by the time ONVIF tells us doesn't also lose
-# its first couple of seconds to RTSP connection setup latency.
+PRE_ROLL_SECONDS = 2.0  # seed of every event (what classify_frames sees): a motion event that's
+# already brief by the time ONVIF tells us doesn't also lose its first couple of seconds to RTSP
+# connection setup latency.
+CONTEXT_SECONDS = 10.0  # extra frames before/after an event, saved to disk only (not classified): see context_*()
+RING_MARGIN_SECONDS = 4.0  # the ring buffer holds CONTEXT_SECONDS + this, so the post-context can still be read late
 RECONNECT_BACKOFF = 2.0
 RTSP_OPEN_TIMEOUT_MS = 10_000  # cv2.VideoCapture() has no timeout by default --
 # confirmed live to hang the reader thread indefinitely during a network blip
@@ -49,9 +51,12 @@ class MotionCapture:
     start_event()/stop_event() mark which frames belong to a motion event, seeded
     with whatever pre-roll was already buffered so fast entrances aren't cut off."""
 
-    def __init__(self, rtsp_url: str, sample_fps: float):
+    def __init__(self, rtsp_url: str, sample_fps: float, context_seconds: float = CONTEXT_SECONDS):
         self.rtsp_url = rtsp_url
         self.sample_fps = sample_fps
+        self.context_seconds = context_seconds
+        self._pre_context: list[tuple[float, "cv2.Mat"]] = []
+        self._event_end: float | None = None   # monotonic-час останнього кадру останньої події
         self._thread: threading.Thread | None = None
         self._stop_reader = threading.Event()
         self._lock = threading.Lock()
@@ -100,7 +105,7 @@ class MotionCapture:
                                 self._event_frames = self._event_frames[-1:]
                         else:
                             self._ring_buffer.append((now, frame))
-                            while self._ring_buffer and now - self._ring_buffer[0][0] > PRE_ROLL_SECONDS:
+                            while self._ring_buffer and now - self._ring_buffer[0][0] > self.context_seconds + RING_MARGIN_SECONDS:
                                 self._ring_buffer.popleft()
             finally:
                 cap.release()
@@ -109,7 +114,11 @@ class MotionCapture:
 
     def start_event(self) -> None:
         with self._lock:
-            self._event_frames = list(self._ring_buffer)
+            now = time.monotonic()
+            self._event_frames = [(t, f) for t, f in self._ring_buffer if now - t <= PRE_ROLL_SECONDS]
+            # контекст «до»: кадри за context_seconds перед подією, без тих, що вже в самій події
+            self._pre_context = [(t, f) for t, f in self._ring_buffer
+                                 if PRE_ROLL_SECONDS < now - t <= self.context_seconds + PRE_ROLL_SECONDS]
 
     def latest_frames(self, n: int, max_age: float = 3.0) -> list:
         """Останні n кадрів із буфера (лише коли немає активної події і потік свіжий), інакше порожньо."""
@@ -126,8 +135,26 @@ class MotionCapture:
             self._event_frames = None
         if not frames:
             return []
+        self._event_end = frames[-1][0]
         t0 = frames[0][0]
         return [(t - t0, frame) for t, frame in frames]
+
+    def pre_context(self) -> list:
+        """Кадри перед останньою подією (до context_seconds, від старого до нового; лише для збереження, не для класифікації)."""
+        with self._lock:
+            ctx, self._pre_context = self._pre_context, []
+        return [f for _, f in ctx]
+
+    def last_event_end(self) -> float | None:
+        """Monotonic-час останнього кадру останньої події (аргумент для post_context)."""
+        with self._lock:
+            return self._event_end
+
+    def post_context(self, event_end: float) -> list:
+        """Кадри після event_end (до context_seconds): викликати не раніше ніж через context_seconds після stop_event.
+        Якщо за цей час почалась нова подія, кадри вже в ній, тут буде лише те, що встигло потрапити в буфер."""
+        with self._lock:
+            return [f for t, f in self._ring_buffer if event_end < t <= event_end + self.context_seconds]
 
 
 def _extract_motion_state(message) -> bool | None:
