@@ -1,0 +1,512 @@
+#!/home/slava/cat_detector/.venv/bin/python
+# Безпечний запуск очищення Furbulous Box: не крутить барабан, якщо в ньому може бути кіт.
+# Вага лотка ненадійна (збій «20 кг»), тому дивимось ще й на камеру:
+#   1) workstatus = 0 (не «кіт поруч»/«кіт у туалеті»/цикл);
+#   2) у ~/cat_detector/data/events.db немає подій за останні BUSY_MINUTES хв;
+#   3) у кадрі немає кота (YOLO) і вікно барабана виглядає як порожнє (яскравість близька до еталона).
+# Еталони: `petbox-safe-clean --calibrate empty` (барабан точно порожній) і `--calibrate occupied`
+# (в барабані кіт/вантаж; можна знімати кілька разів — зберігається список). Без еталона «порожньо» очищення НЕ запускається.
+#   0) спершу motion_gate (стан руху від детектора, data/motion_state.json) і recording_gate (запис SD через pytapo);
+#      вимкнути другу: RECORDING_GATE = False нижче в цьому файлі.
+#      align_gate: стан сторожа положення камери (data/align_state.json) має бути свіжим і TRACKED, еталони — для поточного положення;
+#      вимкнути: ALIGN_GATE = False нижче (бекап до змін: petbox-safe-clean.bak-autorecal-2026-10-26).
+# До 4 спроб з паузою 5 хв; якщо так і зайнято — пуш і вихід.
+# Використання: petbox-safe-clean [--dry-run [--no-question] | --calibrate empty|occupied | --check]
+#   --dry-run: нічого не чистить, шле в Telegram кадр лотка й вердикт (для тестового періоду)
+#     (--check: лише перевірка, без очищення)
+import json, os, sqlite3, subprocess, sys, time, urllib.request
+from urllib.parse import quote
+
+sys.path.insert(0, "/home/slava/cat_detector")
+os.chdir("/home/slava/cat_detector")   # yolov8n.pt підхоплюється відносним шляхом
+import cv2
+import numpy as np
+
+HOME = os.path.expanduser("~")
+CAM_ENV = f"{HOME}/cat_detector/.env"
+EVENTS_DB = f"{HOME}/cat_detector/data/events.db"
+CALIB = f"{HOME}/.config/petbox-safe-clean.json"
+ROI = (0.24, 0.22, 0.39, 0.50)   # вікно барабана на кадрі 1280x720, частки ширини/висоти
+DEVIATION = 0.20                 # відхилення яскравості ROI від еталона, що вважаємо «щось там є»
+BUSY_MINUTES = 5
+ATTEMPTS, PAUSE = 4, 300
+
+def log(msg):
+    print(time.strftime("%F %T"), msg, flush=True)
+
+def notify(msg):
+    try:
+        topic = open(f"{HOME}/.config/petbox.ntfy").read().strip()
+        urllib.request.urlopen(urllib.request.Request(f"https://ntfy.sh/{topic}", data=msg.encode(),
+            headers={"Title": "Furbulous"}), timeout=10)
+    except Exception as e:
+        log(f"не вдалося надіслати пуш: {e}")
+
+def petbox_status():
+    out = subprocess.run([f"{HOME}/bin/petbox", "status"], capture_output=True, text=True, timeout=60).stdout
+    return json.loads(out)["data"]
+
+def grab_frames(n=3, gap=1.0):
+    env = dict(l.strip().split("=", 1) for l in open(CAM_ENV) if "=" in l and not l.startswith("#"))
+    url = f"rtsp://{quote(env['CAMERA_USER'], safe='')}:{quote(env['CAMERA_PASS'], safe='')}@{env['CAMERA_HOST']}:554/stream2"
+    cap = cv2.VideoCapture()
+    cap.set(cv2.CAP_PROP_OPEN_TIMEOUT_MSEC, 10000)
+    cap.set(cv2.CAP_PROP_READ_TIMEOUT_MSEC, 10000)
+    cap.open(url)
+    frames = []
+    try:
+        for _ in range(n):
+            frame = None
+            for _ in range(10):          # скидаємо буфер, беремо свіжий кадр
+                ok, f = cap.read()
+                if ok:
+                    frame = f
+            if frame is not None:
+                frames.append(frame)
+            time.sleep(gap)
+    finally:
+        cap.release()
+    return frames
+
+def frame_mode(frame):
+    """ir — камера в нічному (чорно-білому) режимі, color — звичайний. Еталони порівнюємо лише в межах режиму."""
+    f = frame.astype(np.int16)
+    spread = float(np.mean(np.abs(f[:, :, 0] - f[:, :, 1]) + np.abs(f[:, :, 1] - f[:, :, 2])))
+    if spread >= 4.0:
+        return "color"
+    # ІЧ-режим камери при денному світлі — сірий кадр: вікно барабана вдень темне (40–110) і схоже на чорного кота,
+    # тож міряємо інакше. День/ніч беремо зі скла дверей праворуч (вночі 66–75, вдень 100+); ліва стіна не годиться — там ходить кіт
+    h, w = frame.shape[:2]
+    door = float(np.mean(cv2.cvtColor(frame[int(.083 * h):int(.61 * h), int(.828 * w):int(.992 * w)], cv2.COLOR_BGR2GRAY)))
+    return "irday" if door >= 90 else "ir"
+
+IRDAY_EMPTY = (50, 92)   # вікно/фасад ×100 в сірому денному режимі; межі поставив Слава 26.10 (порожній барабан о 15:00 26.10 = 80, нижче — темний кіт, вище — білий)
+
+def judge(b, mode, calib):
+    """Повертає список причин «не чистити» за яскравістю вікна в даному режимі (порожній список = все чисто)."""
+    if mode == "irday":
+        if b < IRDAY_EMPTY[0] or b > IRDAY_EMPTY[1]:
+            return [f"вікно/фасад {b:.0f} поза межами порожнього {IRDAY_EMPTY[0]}–{IRDAY_EMPTY[1]} (сірий денний режим)"]
+        return []
+    m = calib.get(mode, {})
+    empties, occ = m.get("empty", []), m.get("occupied", [])
+    if not empties:
+        return [f"немає еталона «порожньо» для режиму {mode}"]
+    ref = min(empties, key=lambda e: abs(b - e))
+    out = []
+    if occ and min(abs(b - o) for o in occ) < abs(b - ref):
+        out.append(f"вікно ближче до еталона «зайнято» ({b:.0f}; порожній {ref:.0f}, режим {mode})")
+    if abs(b - ref) > DEVIATION * ref:
+        out.append(f"вікно відрізняється від порожнього ({b:.0f} проти {ref:.0f}, режим {mode})")
+    return out
+
+def aligned_mode(frame):
+    """(кадр, вирівняний на еталонне положення камери; режим камери з урахуванням зсуву). Нема бази вирівнювання чи збій — як було."""
+    try:
+        from drum_check import load_refs, align_with_shift, frame_mode_shifted
+        base = next((r["base"] for r in load_refs().values() if r.get("base")), None)
+        if base is None:
+            return frame, frame_mode(frame)
+        aligned, shift = align_with_shift(frame, base)
+        mode = frame_mode_shifted(frame, shift)
+        if mode is None:   # вікно дверей після зсуву за кадром: день/ніч беремо за сонцем
+            from classify import sun_is_up
+            mode = "irday" if sun_is_up() else "ir"
+        return aligned, mode
+    except Exception as e:
+        log(f"вирівнювання кадру не вдалось ({type(e).__name__}: {e}), міряю як є")
+        return frame, frame_mode(frame)
+
+def roi_brightness(frame, mode=None):
+    h, w = frame.shape[:2]
+    if (mode or frame_mode(frame)) == "irday":   # у сірому денному режимі міряємо вікно відносно фасаду (стійко до сонця)
+        g = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY).astype(float)
+        return 100 * g[int(.28 * h):int(.47 * h), int(.25 * w):int(.38 * w)].mean() / g[int(.69 * h):int(.78 * h), int(.18 * w):int(.47 * w)].mean()
+    x1, y1, x2, y2 = int(ROI[0] * w), int(ROI[1] * h), int(ROI[2] * w), int(ROI[3] * h)
+    return float(np.mean(cv2.cvtColor(frame[y1:y2, x1:x2], cv2.COLOR_BGR2GRAY)))
+
+def as_list(v):
+    return v if isinstance(v, list) else [] if v is None else [v]
+
+def load_calib():
+    try:
+        return json.load(open(CALIB))
+    except Exception:
+        return {}
+
+def calibrate(kind):
+    if kind not in ("empty", "occupied"):
+        log("використання: --calibrate empty|occupied"); sys.exit(1)
+    frames = grab_frames()
+    if not frames:
+        log("кадр не отримано"); sys.exit(1)
+    val = float(np.median([roi_brightness(f) for f in frames]))
+    mode = frame_mode(frames[-1])
+    cv2.imwrite(f"{HOME}/.config/petbox-safe-clean-{mode}-{kind}.jpg", frames[-1])
+    c = load_calib()
+    c.setdefault(mode, {}).setdefault(kind, []).append(val)
+    json.dump(c, open(CALIB, "w"))
+    os.chmod(CALIB, 0o600)
+    log(f"еталон «{kind}» для режиму {mode} збережено: яскравість ROI = {val:.1f}; усі еталони: {c}")
+
+MOTION_STATE = f"{HOME}/cat_detector/data/motion_state.json"
+MOTION_STALE, MOTION_TAIL = 30, 180   # с: детектор «мертвий» / хвіст запису камери ~60 с + запас
+RECORDING_GATE = True                 # False вимикає перевірку запису SD (recording_gate); рух (motion_gate) вимкнути не можна
+RECORDING_TAIL, RECORDING_TIMEOUT = 120, 10
+TAPO_PY = "/tmp/tapo_venv/bin/python"
+TAPO_CODE = """
+import os, re, time
+from pytapo import Tapo
+pw = open(os.path.expanduser("~/.config/tapo.pass")).read().strip()
+host = re.search(r"^CAMERA_HOST=(\\S+)", open(os.path.expanduser("~/cat_detector/.env")).read(), re.M).group(1).strip("'\\"")
+cam = Tapo(host, "admin", pw, cloudPassword=pw)
+ends = [0]
+for d in (time.time() - 86400, time.time()):
+    try:
+        rec = cam.getRecordings(time.strftime("%Y%m%d", time.localtime(d)))
+    except Exception as e:
+        if "-71105" in str(e):   # у цей день записів ще нема
+            continue
+        raise
+    ends += [list(r.values())[0]["endTime"] for r in rec]
+print(max(ends))
+"""
+
+def motion_gate(path=MOTION_STATE, now=None):
+    """Повертає причину відмови за станом руху від детектора або None, якщо тихо."""
+    now = time.time() if now is None else now
+    try:
+        st = json.load(open(path))
+        upd, last, active = float(st["updated_ts"]), float(st["last_motion_ts"]), bool(st["active"])
+    except Exception as e:
+        return f"стан руху від детектора недоступний ({type(e).__name__}), невідомо"
+    if now - upd > MOTION_STALE:
+        return f"детектор не відповідає ({now - upd:.0f} с без оновлення), невідомо"
+    if active:
+        return "камера зараз бачить рух"
+    if now - last < MOTION_TAIL:
+        return f"рух був {now - last:.0f} с тому (чекаємо {MOTION_TAIL} с через хвіст запису)"
+    return None
+
+ALIGN_STATE = f"{HOME}/cat_detector/data/align_state.json"
+ALIGN_STALE = 180                     # с: стан від сторожа положення застарів → відмова
+ALIGN_GATE = True                     # False вимикає перевірку сторожа положення (align_guard у детекторі)
+NCC_DRUM_ENHANCED = 0.70              # поріг NCC барабана в 24 год після промоції нових еталонів
+_enhanced = False
+
+def align_gate(now=None):
+    """Відмова, якщо сторож положення камери (cat-detector, align_state.json) не каже TRACKED із еталонами для поточного положення.
+    Fail-closed: нема файлу / не JSON / застарів / не TRACKED / еталони режиму зняті не там, де лоток зараз."""
+    global _enhanced
+    now = time.time() if now is None else now
+    try:
+        st = json.load(open(ALIGN_STATE))
+        upd, state = float(st["updated_ts"]), st["state"]
+    except Exception as e:
+        return f"стан положення камери недоступний ({type(e).__name__}), невідомо"
+    if now - upd > ALIGN_STALE:
+        return f"сторож положення камери не відповідає ({now - upd:.0f} с без оновлення), невідомо"
+    if state != "TRACKED":
+        return f"лоток у кадрі не підтверджено (стан {state}: {st.get('reason', '?')})"
+    if not st.get("refs_match"):
+        return f"еталони режиму {st.get('mode')} зняті не для поточного положення камери (поза {st.get('pose')}, еталони {st.get('ref_poses')})"
+    _enhanced = now < float(st.get("enhanced_until", 0))
+    return None
+
+def recording_gate(now=None):
+    """Один вхід у камеру (pytapo, лише читання): відмова, якщо запис SD іде або скінчився менше RECORDING_TAIL с тому."""
+    now = time.time() if now is None else now
+    try:
+        r = subprocess.run([TAPO_PY, "-c", TAPO_CODE], capture_output=True, text=True, timeout=RECORDING_TIMEOUT)
+        end = float(r.stdout.strip().splitlines()[-1])
+    except Exception:
+        return "не вдалось перевірити запис камери"
+    if now - end < RECORDING_TAIL:
+        return f"запис камери іде або скінчився {max(now - end, 0):.0f} с тому"
+    return None
+
+NCC_DRUM, NCC_SIDE, NCC_LOST = 0.55, 0.45, 0.2   # пороги як у детектора (drum_check); NCC_LOST — «кадр зовсім не схожий на еталон»
+
+def drum_ncc_gate(frames):
+    """Причина відмови за контурами вікна барабана й бічної смуги (NCC до еталона режиму) або None.
+    Недоступність перевірки (нема еталона/кадрів, помилка) сама відмови не дає — лишаємо рішення яскравості, але пишемо в журнал."""
+    try:
+        from drum_check import load_refs, observe
+        refs = load_refs()
+        obs = [o for o in (observe(f, refs) for f in frames) if o]
+    except Exception as e:
+        log(f"NCC-перевірка барабана не вдалась ({type(e).__name__}: {e}), рішення за яскравістю")
+        return None
+    if not obs:
+        log("NCC-перевірка барабана недоступна (немає кадрів або еталона для режиму), рішення за яскравістю")
+        return None
+    nums = ", ".join(f"{o['mode']}: барабан {o['ncc']:.2f}/смуга {o['side']:.2f}" for o in obs)
+    need = min(2, len(obs))
+    if len(obs) >= 3 and all(o["ncc"] < NCC_LOST and o["side"] < NCC_LOST for o in obs):
+        return f"кадр не схожий на еталон, камеру могли зсунути чи затулити (NCC {nums})"
+    ncc_need = NCC_DRUM_ENHANCED if _enhanced else NCC_DRUM
+    if sum(o["ncc"] < ncc_need for o in obs) >= need:
+        return f"у вікні барабана кіт або щось стороннє (NCC контурів < {ncc_need}: {nums})"
+    if sum(o["side"] < NCC_SIDE for o in obs) >= need:
+        return f"біля лотка кіт або людина (NCC бічної смуги < {NCC_SIDE}: {nums})"
+    if len(obs) < len(frames):
+        log("NCC-перевірка барабана: для частини кадрів нема еталона режиму")
+    return None
+
+def busy_reason():
+    """Повертає причину, чому зараз не можна чистити, або None, якщо все чисто."""
+    why = motion_gate()
+    if why:
+        return why
+    if ALIGN_GATE:
+        why = align_gate()
+        if why:
+            return why
+    if RECORDING_GATE:
+        why = recording_gate()
+        if why:
+            return why
+    ws = petbox_status()["workstatus"]["value"]
+    if ws != 0:
+        return f"workstatus={ws}"
+    since = time.strftime("%Y-%m-%dT%H:%M:%S", time.localtime(time.time() - BUSY_MINUTES * 60))
+    try:
+        rows = sqlite3.connect(f"file:{EVENTS_DB}?mode=ro", uri=True).execute(
+            "select timestamp, cat from events where timestamp > ? order by id desc limit 1", (since,)).fetchall()
+    except Exception as e:
+        return f"не вдалося прочитати events.db: {e}"
+    if rows:
+        return f"подія камери за останні {BUSY_MINUTES} хв: {rows[0][1]} о {rows[0][0]}"
+    calib = load_calib()
+    frames = grab_frames()
+    if not frames:
+        return "не вдалося отримати кадр з камери"
+    why = drum_ncc_gate(frames)
+    if why:
+        return why
+    from detect import detect
+    for f in frames:
+        for d in detect(f, 0.25):
+            if d.label == "cat":
+                return f"YOLO бачить кота (впевненість {d.confidence:.2f})"
+        aligned, mode = aligned_mode(f)
+        why = judge(roi_brightness(aligned, mode), mode, calib)
+        if why:
+            return why[0]
+    return None
+
+def telegram_photo(frame, caption):
+    env = dict(l.strip().split("=", 1) for l in open(CAM_ENV) if "=" in l and not l.startswith("#"))
+    ok, buf = cv2.imencode(".jpg", frame)
+    boundary = "----petboxsafeclean"
+    body = b""
+    for k, v in {"chat_id": env["TELEGRAM_CHAT_ID"], "caption": caption}.items():
+        body += f'--{boundary}\r\nContent-Disposition: form-data; name="{k}"\r\n\r\n{v}\r\n'.encode()
+    body += (f'--{boundary}\r\nContent-Disposition: form-data; name="photo"; filename="litterbox.jpg"\r\n'
+             f'Content-Type: image/jpeg\r\n\r\n').encode() + buf.tobytes() + f"\r\n--{boundary}--\r\n".encode()
+    req = urllib.request.Request(f"https://api.telegram.org/bot{env['TELEGRAM_BOT_TOKEN']}/sendPhoto", data=body,
+                                 headers={"Content-Type": f"multipart/form-data; boundary={boundary}"})
+    return json.load(urllib.request.urlopen(req, timeout=20))["result"]["message_id"]
+
+NO_QUESTION = "--no-question" in sys.argv   # нічні фото: лише вердикт і причина, без питання
+FRAMES = f"{HOME}/petbox-safe-clean-frames"                  # кадри, на які питали/могли відповісти
+QUESTIONS = f"{HOME}/petbox-safe-clean-questions.jsonl"   # що питали: message_id, час, вердикт скрипта
+LABELS = f"{HOME}/petbox-safe-clean-labels.tsv"           # що відповів Slava (колонки через табуляцію, коментар — останній)
+OFFSET = f"{HOME}/.cache/petbox-safe-clean.offset"
+YES, NO = {"так", "да", "yes", "y", "ok", "ок", "+", "👍"}, {"ні", "нет", "no", "n", "-", "👎"}
+
+def poll_replies(wait=0):
+    """Читає відповіді «так/ні» з Telegram і дописує до LABELS. Відповідь — reply на фото або просто текст (до останнього питання)."""
+    env = dict(l.strip().split("=", 1) for l in open(CAM_ENV) if "=" in l and not l.startswith("#"))
+    try:
+        qs = [json.loads(l) for l in open(QUESTIONS)]
+    except FileNotFoundError:
+        qs = []
+    done = set()
+    if os.path.exists(LABELS):
+        done = {l.split("\t")[0] for l in open(LABELS)}
+    try:
+        off = int(open(OFFSET).read())
+    except Exception:
+        off = 0
+    url = f"https://api.telegram.org/bot{env['TELEGRAM_BOT_TOKEN']}/getUpdates?timeout={wait}&offset={off}"
+    ups = json.load(urllib.request.urlopen(url, timeout=wait + 20))["result"]
+    for u in ups:
+        off = u["update_id"] + 1
+        m = u.get("message") or {}
+        log(f"оновлення {u['update_id']}: тип={[k for k in u if k != 'update_id']}, чат={m.get('chat', {}).get('id')}, текст={(m.get('text') or '')[:40]!r}")
+        if str(m.get("chat", {}).get("id")) != env["TELEGRAM_CHAT_ID"]:
+            continue
+        text = (m.get("text") or m.get("caption") or "").strip()
+        low = text.lower()
+        if low.startswith("почисти") and time.time() - m.get("date", 0) < 600:   # старіші за 10 хв команди ігноруємо
+            clean_on_command(force="все одно" in low or "примусово" in low, env=env)
+            continue
+        words = text.lower().replace(",", " ").replace(".", " ").replace("!", " ").split()
+        first = words[0] if words else ""
+        ans = "так" if first in YES else "ні" if first in NO else None
+        if not ans and not (m.get("reply_to_message") and text):
+            continue   # розлога відповідь без так/ні враховується лише як reply на фото (тоді відповідь «?» + коментар)
+        ans = ans or "?"
+        rid = (m.get("reply_to_message") or {}).get("message_id")
+        open_qs = [q for q in qs if str(q["message_id"]) not in done and q["ts"] <= m["date"]]
+        q = next((q for q in qs if q["message_id"] == rid and str(rid) not in done), open_qs[-1] if open_qs else None)
+        if q:
+            done.add(str(q["message_id"]))
+            with open(LABELS, "a") as f:
+                f.write("\t".join([str(q["message_id"]), time.strftime("%F %T", time.localtime(q["ts"])), q["verdict"], ans,
+                                    q.get("frame", ""), " ".join(text.split())]) + "\n")
+            log(f"відповідь {ans} на питання {q['message_id']} (скрипт казав: {q['verdict']})")
+    os.makedirs(os.path.dirname(OFFSET), exist_ok=True)
+    open(OFFSET, "w").write(str(off))
+
+def tg_text(env, text):
+    data = json.dumps({"chat_id": env["TELEGRAM_CHAT_ID"], "text": text}).encode()
+    urllib.request.urlopen(urllib.request.Request(f"https://api.telegram.org/bot{env['TELEGRAM_BOT_TOKEN']}/sendMessage",
+                           data=data, headers={"Content-Type": "application/json"}), timeout=20)
+
+def clean_on_command(force, env):
+    """Команда «почисти лоток» з Telegram. Спершу ті ж перевірки безпеки; «почисти все одно» їх обходить
+    (крім випадку, коли цикл уже триває)."""
+    tg_text(env, "Прийняв, перевіряю камеру і лоток…" if not force else "Прийняв, запускаю примусово…")
+    ws = petbox_status()["workstatus"]["value"]
+    if ws in (1, 2, 3, 4, 7, 8):
+        return tg_text(env, f"Лоток зараз у циклі (workstatus={ws}), нічого не запускаю.")
+    if not force:
+        reason = busy_reason()
+        if reason:
+            log(f"команда «почисти»: відмовлено — {reason}")
+            return tg_text(env, f"Не чищу: {reason}.\nЯкщо точно можна, напиши «почисти все одно».")
+    log(f"команда «почисти»: запускаю очищення{' (примусово)' if force else ''}")
+    subprocess.run([f"{HOME}/bin/petbox", "clean"], capture_output=True, timeout=60)
+    time.sleep(20)
+    after = petbox_status()["workstatus"]["value"]
+    if after != 1:
+        return tg_text(env, f"Команду прийнято, але цикл не почався (workstatus={after}).")
+    tg_text(env, "Очищення запущено. Напишу, коли закінчиться.")
+    import threading
+    threading.Thread(target=notify_when_done, args=(env, time.time()), daemon=True).start()   # щоб не блокувати прийом команд
+
+def notify_when_done(env, started, limit=900):
+    """Чекає, поки лоток повернеться в стан 0 (двічі поспіль), і пише в Telegram."""
+    zeros = 0
+    while time.time() - started < limit:
+        time.sleep(10)
+        try:
+            ws = petbox_status()["workstatus"]["value"]
+        except Exception:
+            continue
+        zeros = zeros + 1 if ws == 0 else 0
+        if zeros >= 2:
+            mins = (time.time() - started) / 60
+            return tg_text(env, f"Очищення закінчилось (~{mins:.0f} хв). Лоток у стані 0.")
+    tg_text(env, "Очищення триває понад 15 хв або лоток завис, перевір сам.")
+
+def report():
+    rows = [l.rstrip("\n").split("\t") for l in open(LABELS)] if os.path.exists(LABELS) else []
+    rows = [r for r in rows if len(r) >= 4 and r[3] in ("так", "ні")]
+    tot = len(rows)
+    ok = sum(1 for r in rows if (r[2] == "clean") == (r[3] == "так"))
+    danger = [r for r in rows if r[2] == "clean" and r[3] == "ні"]
+    print(f"відповідей: {tot}, збіглось: {ok}; НЕБЕЗПЕЧНО (скрипт казав «чистити», Slava «ні»): {len(danger)}")
+    for r in danger: print("  ", r[1], r[4] if len(r) > 4 else "", "—", r[5] if len(r) > 5 else "")
+    wrong = [r for r in rows if (r[2] == "clean") != (r[3] == "так")]
+    print(f"розбіжності (вердикт скрипта ≠ відповідь): {len(wrong)}")
+    for r in wrong: print("  ", r[1], f"скрипт={r[2]}", f"Slava={r[3]}", r[4] if len(r) > 4 else "", "—", r[5] if len(r) > 5 else "")
+
+def dry_run():
+    """Пробний режим: нічого не чистимо, лише шлемо в Telegram кадр і вердикт «чистив би / не чистив би»."""
+    lines, verdict = [], []
+    st = petbox_status()
+    ws, weight = st["workstatus"]["value"], st["catWeight"]["value"]
+    lines.append(f"лоток: workstatus={ws}, вага {weight / 1000:.2f} кг")
+    if ws != 0:
+        verdict.append(f"workstatus={ws}")
+    since = time.strftime("%Y-%m-%dT%H:%M:%S", time.localtime(time.time() - BUSY_MINUTES * 60))
+    try:
+        last = sqlite3.connect(f"file:{EVENTS_DB}?mode=ro", uri=True).execute(
+            "select timestamp, cat from events order by id desc limit 1").fetchone()
+        lines.append(f"остання подія камери: {last[1]} о {last[0][11:19]}" if last else "подій камери ще не було")
+        if last and last[0] > since:
+            verdict.append(f"подія камери за {BUSY_MINUTES} хв")
+    except Exception as e:
+        lines.append(f"events.db недоступна: {e}")
+        verdict.append("events.db недоступна")
+    frames = grab_frames()
+    if not frames:
+        log("камера не віддала кадр")
+        notify("Пробне очищення: камера не віддала кадр")
+        return
+    from detect import detect
+    calib = load_calib()
+    aligned = [aligned_mode(f) for f in frames]
+    mode = aligned[-1][1]
+    cat_seen = any(d.label == "cat" for f in frames for d in detect(f, 0.25))
+    b = float(np.median([roi_brightness(a, m) for a, m in aligned]))
+    ncc_why = drum_ncc_gate(frames)
+    if ncc_why:
+        verdict.append(ncc_why)
+    em = calib.get(mode, {}).get("empty", [])
+    lines.append(f"режим камери: { {'ir': 'нічний (ІЧ)', 'irday': 'сірий денний (вікно/фасад ×100)'}.get(mode, 'кольоровий') }; YOLO: {'кіт є' if cat_seen else 'кота не видно'}; "
+                 f"яскравість вікна {b:.0f}" + (f" (порожній {min(em, key=lambda e: abs(b - e)):.0f})" if em else " (еталона «порожньо» для цього режиму ще нема)"))
+    if cat_seen:
+        verdict.append("YOLO бачить кота")
+    verdict += judge(b, mode, calib)
+    head = "НЕ чистив би: " + ", ".join(verdict) if verdict else "ЧИСТИВ БИ (усе чисто)"
+    caption = (f"🧪 Пробний режим, очищення НЕ запускалось\n{head}\n" + "\n".join(lines)
+               + ("" if NO_QUESTION else "\n\nЧи було б ок почистити зараз? Відповідай «так» або «ні» (reply на це фото або просто текстом)"))
+    log(caption.replace("\n", " | "))
+    mid = telegram_photo(frames[-1], caption)
+    os.makedirs(FRAMES, exist_ok=True)
+    frame_path = f"{FRAMES}/{time.strftime('%Y%m%d-%H%M%S')}-{mid}.jpg"
+    cv2.imwrite(frame_path, frames[-1])
+    with open(QUESTIONS, "a") as f:   # відповісти «так/ні» можна на будь-яке фото, і на нічне теж
+        f.write(json.dumps({"message_id": mid, "ts": int(time.time()), "verdict": "busy" if verdict else "clean",
+                            "why": "; ".join(verdict), "frame": frame_path, "asked": not NO_QUESTION}) + "\n")
+
+def bot_loop():
+    """Довгий опитувальний цикл (long polling): Telegram відповідає одразу, щойно з'явилось повідомлення. Служба petbox-bot."""
+    log("petbox-bot запущено")
+    while True:
+        try:
+            poll_replies(wait=30)
+        except Exception as e:
+            log(f"помилка опитування Telegram: {e}")
+            time.sleep(10)
+
+def main():
+    if "--bot" in sys.argv:
+        return bot_loop()
+    if "--dry-run" in sys.argv:
+        return dry_run()
+    if "--poll-replies" in sys.argv:
+        return poll_replies()
+    if "--report" in sys.argv:
+        return report()
+    if "--calibrate" in sys.argv:
+        return calibrate(sys.argv[sys.argv.index("--calibrate") + 1] if len(sys.argv) > sys.argv.index("--calibrate") + 1 else "")
+    for n in range(1, ATTEMPTS + 1):
+        reason = busy_reason()
+        if reason is None:
+            break
+        log(f"не чистимо (спроба {n}): {reason}")
+        if "--check" in sys.argv:
+            return
+        if n < ATTEMPTS:
+            time.sleep(PAUSE)
+    else:
+        log("пропущено: так і не стало безпечно")
+        notify(f"Планове очищення пропущено: {reason}")
+        return
+    if "--check" in sys.argv:
+        log("безпечно: очищення можна запускати")
+        return
+    subprocess.run([f"{HOME}/bin/petbox", "clean"], capture_output=True, timeout=60)
+    time.sleep(20)
+    ws = petbox_status()["workstatus"]["value"]
+    log(f"очищення запущено, стан після: {ws}")
+    if ws == 0:
+        notify("Команду очищення прийнято, але туалет не почав цикл")
+
+if __name__ == "__main__":
+    main()
