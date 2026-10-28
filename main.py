@@ -278,13 +278,15 @@ async def main() -> None:
                     dwell_seconds=result["dwell_seconds"],
                     source_clip="live",
                 )
-                frame = result.get("best_frame")
-                if frame is not None:  # кадри лишаємо для калібрування порогів білий/чорний
+                best = result.get("best_frame")
+                # unknown / pass_through: кота в кадрі не знайшли, але сповіщення все одно має мати фото — беремо середній кадр події
+                frame = best if best is not None else frames[len(frames) // 2][1]
+                if frame is not None:  # кадри лишаємо для калібрування порогів білий/чорний; petbox-autoclean бере звідси фото візиту
                     frames_dir = Path(__file__).parent / "data" / "frames"
                     frames_dir.mkdir(parents=True, exist_ok=True)
                     cv2.imwrite(str(frames_dir / f"{now:%Y%m%d-%H%M%S}-{result['cat']}.jpg"), frame)
                 loggable = {k: v for k, v in result.items() if k != "best_frame"}
-                logger.info("Event classified: %s (photo: %s)", loggable, frame is not None)
+                logger.info("Event classified: %s (photo: %s)", loggable, best is not None)
                 if human:
                     logger.info("У кадрі події людина, сповіщення про кота не шлемо")
                     continue
@@ -318,7 +320,10 @@ async def main() -> None:
                         telegram_notify.notify_passby(color, result["is_day"], frame=frame)
                         asyncio.create_task(recheck_inside(color, ts))
                 elif result["cat"] == "pass_through":
+                    telegram_notify.notify_unknown(result["is_day"], frame=frame)
                     asyncio.create_task(recheck_inside("unknown", ts))
+                elif result["cat"] == "unknown":
+                    telegram_notify.notify_unknown(result["is_day"], frame=frame)
         except asyncio.CancelledError:
             raise
         except Exception:

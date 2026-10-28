@@ -107,3 +107,8 @@ def notify_inside(cat: str, frame=None) -> None:
     label = CAT_LABEL_UK.get(cat, cat)
     emoji = CAT_EMOJI.get(cat, "🐾")
     _notify(f"{emoji} Кіт зайшов у лоток і сидить усередині ({label.lower()})", frame)
+
+
+def notify_unknown(is_day: bool, frame=None) -> None:
+    time_of_day = "вдень" if is_day else "вночі"
+    _notify(f"❔ Рух біля лотка, кота не розпізнано ({time_of_day})", frame)

@@ -24,6 +24,7 @@ ONCE = "--once" in sys.argv
 ASSUME_DIRTY = "--assume-dirty" in sys.argv
 LOOP_SEC = 60
 CLEAN_MARGIN_MIN = 15      # цикл не має заходити у заборонене вікно
+CYCLE_TAIL_SEC = 30        # події, записані детектором до цього запасу після кінця циклу, — рух барабана, не візит
 DONE_LIMIT = 900           # с очікування кінця циклу
 TZ = ZoneInfo("Europe/Lisbon")
 DEFAULTS = {"ENABLED": "1", "QUIET_MIN": "15", "BAN": "02:00-10:00", "MIN_GAP_MIN": "60", "MAX_PER_DAY": "6"}
@@ -75,8 +76,35 @@ def last_events():
         r = db.execute(sql).fetchone()
         return datetime.fromisoformat(r[0]).timestamp() if r else None   # timestamp у events.db — локальний час (Лісабон)
     anyev = ts("select timestamp from events order by id desc limit 1")
-    visit = ts("select timestamp from events where cat not like '%passby%' and cat != 'pass_through' order by id desc limit 1")
+    visit = ts(VISIT_SQL)
     return anyev, visit
+
+VISIT_SQL = "select timestamp, cat from events where cat not like '%passby%' and cat != 'pass_through' order by id desc limit 1"
+CAT_UK = {"white": "білий", "black": "чорний", "unknown": "кіт не розпізнаний"}
+
+def last_visit_row():
+    """(timestamp ISO, cat) останньої події-візиту або None."""
+    db = sqlite3.connect(f"file:{psc.EVENTS_DB}?mode=ro", uri=True)
+    return db.execute(VISIT_SQL).fetchone()
+
+def visit_frame(row):
+    """(кадр, підпис) візиту з data/frames, куди його кладе детектор: <мітка>-<cat>.jpg, а для старих подій — середній кадр теки події. None, якщо нема."""
+    try:
+        ts, cat = row
+        stamp = datetime.fromisoformat(ts).strftime("%Y%m%d-%H%M%S")
+        base = f"{HOME}/cat_detector/data/frames"
+        path = f"{base}/{stamp}-{cat}.jpg"
+        if not os.path.exists(path):
+            shots = sorted(f for f in os.listdir(f"{base}/events/{stamp}") if f.endswith(".jpg"))
+            path = f"{base}/events/{stamp}/{shots[len(shots) // 2]}"
+        frame = psc.cv2.imread(path)
+        if frame is None:
+            return None
+        who = CAT_UK.get(cat.removesuffix("_inside"), cat)
+        return frame, f"🐈 Візит, після якого чищу: {who}, {ts[11:16]}"
+    except Exception as e:
+        log(f"фото візиту не знайдено ({type(e).__name__}: {e})")
+        return None
 
 def tg_env():
     return dict(l.strip().split("=", 1) for l in open(psc.CAM_ENV) if "=" in l and not l.startswith("#"))
@@ -118,7 +146,8 @@ def eligible(c, st, now):
         anyev, visit = last_events()
     except Exception as e:
         return f"events.db недоступна ({e})"
-    if not ASSUME_DIRTY and not (visit and visit > st["last_clean_ts"]):
+    # візит має бути пізніше за кінець минулого циклу: рух самого барабана детектор пише як подію (так 28.10 о 21:29 пішла зайва чистка)
+    if not ASSUME_DIRTY and not (visit and visit > max(st["last_clean_ts"], st.get("cycle_end_ts", 0))):
         return "після останнього очищення візитів не було"
     quiet = float(c["QUIET_MIN"]) * 60
     last_act = max(anyev or 0, visit or 0)
@@ -182,6 +211,14 @@ def run_clean(c, st):
     frame = fresh_frame()
     if frame is None:
         return "не чистимо: камера не віддала кадр для фото"
+    vf = None
+    try:
+        row = last_visit_row()
+        vf = visit_frame(row) if row else None
+    except Exception as e:
+        log(f"фото візиту: не вдалось прочитати events.db ({e})")
+    if vf:
+        photo(vf[0], vf[1])              # збій цього фото не блокує чистку, на відміну від фото «до»
     if not photo(frame, "🧹 Автоочищення: перевірки пройдені, збираюсь чистити (фото ДО)"):
         return "не чистимо: фото «до» не надіслано в Telegram"
     reason = psc.busy_reason()          # друга перевірка вже після фото
@@ -216,6 +253,8 @@ def run_clean(c, st):
         return f"команда відправлена, цикл не почався (workstatus={ws})"
     photo(start_frame, "▶️ Автоочищення: цикл почався (фото НА СТАРТІ: знято перед командою запуску)")
     ok = wait_done(now)
+    st["cycle_end_ts"] = time.time() + CYCLE_TAIL_SEC
+    save_state(st)
     f3 = fresh_frame()
     cap = (f"✅ Автоочищення закінчилось (~{(time.time() - now) / 60:.0f} хв), фото ПІСЛЯ" if ok
            else "⚠️ Автоочищення триває понад 15 хв або лоток завис, перевір сам (фото зараз)")
