@@ -1,0 +1,250 @@
+#!/usr/bin/env python3
+# Керування розумним туалетом Furbulous Box через хмарне API апки.
+# Підпис: sign = md5(appid + path + ts). Токен — ~/.config/petbox.token (права 600).
+# Використання: petbox status | history [днів] | cats | clean | auto | watch | summary | get <path> [k=v ...] | set <ключ>=<значення> ...
+import hashlib, json, os, sys, time, urllib.request, urllib.error
+
+HOST = "https://app.api.fr.furbulouspet.com:1443"
+def _conf():
+    """APPID і IOTID лежать у ~/.config/petbox.conf (KEY=VALUE, права 600), не в коді."""
+    c = {}
+    for l in open(os.path.expanduser("~/.config/petbox.conf")):
+        l = l.split("#", 1)[0].strip()
+        if "=" in l:
+            k, v = l.split("=", 1)
+            c[k.strip()] = v.strip()
+    return c
+
+_C = _conf()
+APPID = _C["APPID"]
+IOTID = _C["IOTID"]
+TOKEN = open(os.path.expanduser("~/.config/petbox.token")).read().strip()
+
+def call(method, path, query="", body=None):
+    ts = str(int(time.time()))
+    h = {"content-type": "application/json", "appid": APPID, "authorization": TOKEN, "ts": ts,
+         "sign": hashlib.md5((APPID + path + ts).encode()).hexdigest(),
+         "platform": "ios", "version": "1.0.0", "accept-language": "en",
+         "user-agent": "Furbulous/2.0.2 (com.furbulous.pet; build:202511121430; iOS 26.6.1) Alamofire/4.9.1"}
+    data = json.dumps(body, separators=(",", ":")).encode() if body is not None else None
+    req = urllib.request.Request(HOST + path + (("?" + query) if query else ""), data=data, headers=h, method=method)
+    try:
+        with urllib.request.urlopen(req, timeout=15) as r:
+            return json.load(r)
+    except urllib.error.HTTPError as e:
+        return {"http": e.code, "body": e.read().decode(errors="replace")[:300]}
+
+def setprops(items):
+    return call("POST", "/app/v1/device/properties/set", body={"iotid": IOTID, "items": items})
+
+a = sys.argv[1:] or ["status"]
+if a[0] == "status":
+    r = call("GET", "/app/v1/device/properties/get", f"iotid={IOTID}")
+    print(json.dumps(r, ensure_ascii=False, indent=1))
+elif a[0] == "clean":
+    print(setprops({"handMode": 1}))
+elif a[0] == "get":
+    extra = "&".join(a[2:])
+    print(json.dumps(call("GET", a[1], f"iotid={IOTID}" + ("&" + extra if extra else "")), ensure_ascii=False, indent=1))
+elif a[0] == "set":
+    print(setprops({k: (int(v) if v.lstrip("-").isdigit() else v) for k, v in (x.split("=", 1) for x in a[1:])}))
+
+# Стани робочого циклу (workstatus у панелі)
+WORK = {0: "-", 1: "очищення", 2: "пересипання", 3: "пакування", 4: "вирівнювання піску", 5: "кіт поруч",
+        6: "кіт у туалеті", 7: "пауза", 8: "повернення в початкове положення"}
+
+def history(days):
+    now = int(time.time())
+    r = call("GET", "/app/v1/device/data/workStatus", f"iotid={IOTID}&start_time={now - days * 86400}&end_time={now}")
+    for x in r.get("data") or []:
+        t = time.strftime("%Y-%m-%d %H:%M", time.localtime(x["start_time"]))
+        if x["status_type"] == 1:   # візит кота: вага у грамах
+            who = x["nickname"] or ("невідомий кіт" if x["pet_id"] in (0, -1) else f"pet {x['pet_id']}")
+            print(f"{t}  візит   {x['weight'] / 1000:5.2f} кг  {x['minute']}хв {x['second']}с  {who}")
+        else:
+            print(f"{t}  цикл    {WORK.get(x['work_status'], x['work_status'])}")
+
+if a[0] == "history":
+    history(int(a[1]) if len(a) > 1 else 7)
+elif a[0] == "cats":
+    for c in call("GET", "/app/v1/device/data/getPetsByUid", f"iotid={IOTID}").get("data") or []:
+        print(f"{c['pet_id']}  {c['nickname']}  {c['weight']} кг")
+
+def workstatus():
+    d = call("GET", "/app/v1/device/properties/get", f"iotid={IOTID}")["data"]
+    return d["workstatus"]["value"]
+
+def log(msg):
+    print(time.strftime("%F %T"), msg, flush=True)
+
+def notify(msg):
+    # Пуш на телефон через ntfy.sh (тема — у ~/.config/petbox.ntfy); збій сповіщення нічого не ламає
+    try:
+        topic = open(os.path.expanduser("~/.config/petbox.ntfy")).read().strip()
+        urllib.request.urlopen(urllib.request.Request(f"https://ntfy.sh/{topic}", data=msg.encode(),
+            headers={"Title": "Furbulous"}), timeout=10)
+    except Exception as e:
+        print("не вдалося надіслати пуш:", e, flush=True)
+
+if a[0] == "auto":
+    # Для розкладу (cron): очищення лише якщо пристрій у спокої; до 4 спроб з паузою 5 хв (кіт може бути поруч)
+    try:
+        for n in range(1, 5):
+            ws = workstatus()
+            now = int(time.time())
+            recent = [x for x in call("GET", "/app/v1/device/data/workStatus", f"iotid={IOTID}&start_time={now - 1200}&end_time={now}")["data"] or []
+                      if x["status_type"] == 2 and x["work_status"] in (1, 2, 3)]
+            if recent:
+                log("пропущено: пристрій уже чистив сам за останні 20 хв")
+                break
+            if ws == 0:
+                setprops({"handMode": 1})
+                time.sleep(20)
+                after = workstatus()
+                log(f"очищення запущено (спроба {n}), стан після: {WORK.get(after)}")
+                if after == 0:
+                    notify("Команду очищення прийнято, але туалет не почав цикл")
+                break
+            log(f"пристрій зайнятий ({WORK.get(ws, ws)}), спроба {n}")
+            if n < 4:
+                time.sleep(300)
+        else:
+            log("пропущено: пристрій так і лишився зайнятий")
+            notify("Планове очищення пропущено: туалет зайнятий понад 15 хв")
+    except Exception as e:
+        log(f"помилка: {e}")
+        notify(f"Планове очищення не вдалося: {e}")
+        sys.exit(1)
+
+if a[0] == "watch":
+    # Постійний режим: пуш на кожен новий запис візиту кота (опитування хмари кожні 5 хв)
+    seen, first, failing = set(), True, False
+    while True:
+        try:
+            now = int(time.time())
+            r = call("GET", "/app/v1/device/data/workStatus", f"iotid={IOTID}&start_time={now - 6 * 3600}&end_time={now}")
+            for x in r["data"] or []:
+                if x["status_type"] != 1 or x["record_id"] in seen:
+                    continue
+                seen.add(x["record_id"])
+                if first:
+                    continue
+                who = x["nickname"] or "Невідомий кіт"
+                w = f"{x['weight'] / 1000:.1f} кг" if 0 < x["weight"] < 20000 else "вага невідома"
+                msg = f"{who} відвідав туалет: {w}, {x['minute']}хв {x['second']}с"
+                log(msg)
+                notify(msg)
+            first = False
+            if failing:
+                log("зв'язок з хмарою відновлено")
+            failing = False
+        except Exception as e:
+            if not failing:
+                log(f"помилка опитування: {e}")
+                notify(f"Стеження за візитами зупинилось через помилку: {e}")
+            failing = True
+        time.sleep(300)
+
+if a[0] == "summary":
+    # Підсумок за 24 години: візити, цикли, сповіщення пристрою; пуш на телефон (cron о 12:10)
+    import collections
+    try:
+        now = int(time.time())
+        rows = call("GET", "/app/v1/device/data/workStatus", f"iotid={IOTID}&start_time={now - 86400}&end_time={now}")["data"] or []
+        visits = [x for x in rows if x["status_type"] == 1]
+        cycles = collections.Counter(WORK.get(x["work_status"], x["work_status"]) for x in rows if x["status_type"] != 1)
+        lines = [f"Візитів: {len(visits)}"]
+        by = collections.defaultdict(list)
+        for x in visits:
+            by[x["nickname"] or "невідомий кіт"].append(x)
+        for who, xs in by.items():
+            ws = [x["weight"] / 1000 for x in xs if 0 < x["weight"] < 20000]
+            lines.append(f"  {who}: {len(xs)}" + (f", середня вага {sum(ws) / len(ws):.1f} кг" if ws else ", вага невідома"))
+        lines.append("Цикли: " + (", ".join(f"{k} ×{v}" for k, v in cycles.items()) or "немає"))
+        push = call("GET", "/app/v1/user/devicePushRecord", "page_no=1&page_size=50")["data"]["list"]
+        alerts = collections.Counter(x["summary"] for x in push if x["push_time"] > now - 86400)
+        if alerts:
+            lines.append("Сповіщення пристрою: " + ", ".join(f"{k} ×{v}" for k, v in alerts.items()))
+        # Дані сторожа (~/petbox-guard.log) за добу: зависання, помилки, ваги, цикли
+        try:
+            import re
+            since = time.strftime("%F %T", time.localtime(now - 86400))
+            glines = [l.rstrip("\n") for l in open(os.path.expanduser("~/petbox-guard.log"), encoding="utf-8")
+                      if re.match(r"\d{4}-\d\d-\d\d \d\d:\d\d:\d\d ", l) and l[:19] >= since]
+            hangs = [l for l in glines if " завис:" in l]
+            errs = collections.Counter(re.sub(r".*помилка: \d+( \(.*?\))? → ", "", l)
+                                       for l in glines if " помилка:" in l and not l.endswith(" → 1") and "помилка опитування" not in l)
+            wts = [int(m.group(1)) for l in glines for m in [re.search(r"вага: \d+ → (\d+)", l)] if m]
+            ncyc = sum(1 for l in glines if "→ очищення" in l)
+            g = [f"Сторож: циклів очищення {ncyc}, зависань {len(hangs)}"]
+            if errs:
+                g.append("помилки " + ", ".join(f"{k} ×{v}" for k, v in errs.items()))
+            if wts:
+                g.append(f"ваги {min(wts) / 1000:.1f}–{max(wts) / 1000:.1f} кг")
+            lines.append(", ".join(g))
+            if hangs:
+                lines.append("  " + hangs[-1][11:])
+        except FileNotFoundError:
+            pass
+        if visits and all(x["weight"] >= 20000 for x in visits):
+            lines.append("Увага: усі візити з вагою 20 кг, датчик ваги, схоже, збоїть")
+        elif not visits:
+            lines.append("Візитів не зафіксовано; якщо коти ходили, датчик ваги може не працювати")
+        msg = "\n".join(lines)
+        log("\n" + msg)
+        notify("Підсумок за добу\n" + msg)
+    except Exception as e:
+        log(f"помилка підсумку: {e}")
+        notify(f"Не вдалося зібрати підсумок: {e}")
+        sys.exit(1)
+
+if a[0] == "guard":
+    # Постійний режим: стежить за циклом «візит → очищення», пише всі зміни стану в журнал і шле пуш при збоях.
+    # Пуші: стан завис надто довго, цикл завершився з кодом ≠ 1, з'явився новий код помилки. Лише сповіщення, нічого не перезапускає.
+    LIMIT = {6: 360, 5: 180}          # секунд; для решти ненульових станів — DEFAULT_LIMIT
+    DEFAULT_LIMIT = 300
+    ERR = {512: "кришка", 128: "немає пакета", 4096: "кіт поруч", 524288: "системна помилка E4"}
+    def errtext(v):
+        names = [n for m, n in ERR.items() if v & m]
+        return f"{v}" + (f" ({', '.join(names)})" if names else "")
+    prev = None
+    since = time.time()
+    warned = False
+    cycle_seen = False
+    while True:
+        try:
+            d = call("GET", "/app/v1/device/properties/get", f"iotid={IOTID}")["data"]
+            cur = {k: d[k]["value"] for k in ("workstatus", "completionStatus", "errorReportEvent", "catWeight")}
+            if prev is None:
+                log(f"старт: {cur}")
+            else:
+                if cur["workstatus"] != prev["workstatus"]:
+                    since, warned = time.time(), False
+                    log(f"стан: {WORK.get(prev['workstatus'], prev['workstatus'])} → {WORK.get(cur['workstatus'], cur['workstatus'])}"
+                        f" (completion={cur['completionStatus']}, error={cur['errorReportEvent']}, вага={cur['catWeight']})")
+                    if prev["workstatus"] in (1, 2, 3, 4):
+                        cycle_seen = True
+                    if cur["workstatus"] == 0 and cycle_seen:
+                        cycle_seen = False
+                        if cur["completionStatus"] != 1:
+                            notify(f"Цикл очищення завершився з кодом {cur['completionStatus']} (очікується 1). Перевірте туалет")
+                if cur["errorReportEvent"] != prev["errorReportEvent"]:
+                    log(f"помилка: {errtext(prev['errorReportEvent'])} → {errtext(cur['errorReportEvent'])}")
+                    if cur["errorReportEvent"] not in (0, 1):
+                        notify(f"Туалет повідомив помилку: {errtext(cur['errorReportEvent'])}")
+                if cur["catWeight"] != prev["catWeight"]:
+                    log(f"вага: {prev['catWeight']} → {cur['catWeight']}")
+                    if cur["catWeight"] >= 10000:
+                        notify(f"Датчик ваги показав {cur['catWeight'] / 1000:.1f} кг (поза діапазоном). Підніміть і опустіть кришку для рекалібрації")
+                    elif cur["catWeight"] > 6800:   # коти 5,5–6,0 кг; більше — схоже на дрейф нуля
+                        notify(f"Вага {cur['catWeight'] / 1000:.1f} кг, а коти важать 5,5–6,0 кг: схоже на дрейф нуля. Підніміть і опустіть кришку")
+            ws = cur["workstatus"]
+            lim = LIMIT.get(ws, DEFAULT_LIMIT)
+            if ws != 0 and not warned and time.time() - since > lim:
+                warned = True
+                log(f"завис: {WORK.get(ws, ws)} понад {lim // 60} хв")
+                notify(f"Туалет завис у стані «{WORK.get(ws, ws)}» понад {lim // 60} хв. Підніміть кришку або перевірте")
+            prev = cur
+        except Exception as e:
+            log(f"помилка опитування: {e}")
+        time.sleep(20 if prev and prev["workstatus"] != 0 else 60)
