@@ -463,6 +463,18 @@ def dry_run():
     with open(QUESTIONS, "a") as f:   # відповісти «так/ні» можна на будь-яке фото, і на нічне теж
         f.write(json.dumps({"message_id": mid, "ts": int(time.time()), "verdict": "busy" if verdict else "clean",
                             "why": "; ".join(verdict), "frame": frame_path, "asked": not NO_QUESTION}) + "\n")
+    shadow_log(frame_path, "block" if verdict else "allow", "; ".join(verdict))
+
+def shadow_log(frame_path, current, reason):
+    """Тіньовий режим litter_algo: ПІСЛЯ рішення фоном дописує вердикт алгоритму в ~/cat_detector/data/litter_shadow.jsonl.
+    Нічого не чистить, не блокує і не пише в Telegram; будь-який збій ковтається, відповідь не читається."""
+    try:
+        subprocess.Popen(["timeout", "20", sys.executable, "-m", "litter_algo.shadow", "--frame", frame_path,
+                          "--current", current, "--reason", reason, "--source", "petbox-safe-clean-dry-run"],
+                         cwd=f"{HOME}/cat_detector", stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                         stderr=subprocess.DEVNULL, start_new_session=True)
+    except Exception:
+        pass
 
 def bot_loop():
     """Довгий опитувальний цикл (long polling): Telegram відповідає одразу, щойно з'явилось повідомлення. Служба petbox-bot."""
