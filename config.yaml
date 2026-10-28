@@ -70,3 +70,7 @@ thresholds:
 align_guard: true      # true | false (YAML: on/off = булеве). false = поведінка як раніше; petbox-safe-clean тоді відмовляє: стан застарів
 align_notify: true     # повідомлення Славі в ~/outbox при LOST/довгому UNCERTAIN (не частіше 1 на 6 год, ≤3 на добу, не вночі)
 align_promote: manual  # manual = лише збирає кандидатів (data/refs_cand) і логує консенсус; auto = ще й автопромоція (потребує окремого рішення Слави); off = нічого не знімати
+
+# «Кіт усередині» (кінець події й recheck_inside) рішає litter_algo через drum_algo.py (28.10.2026), як у petbox-safe-clean.
+# false = старі NCC-ознаки drum_check. Якщо litter_algo збійнув (немає cv2, битий кадр), діють старі ознаки. Зміна потребує перезапуску.
+drum_algo: true

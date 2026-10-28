@@ -4,6 +4,7 @@ import statistics
 import cv2
 import numpy as np
 
+import drum_algo
 from detect import Detection, detect
 from align_guard import blend_allowed
 from drum_check import align_with_shift, NCC_CAT, REF_UPDATE_NCC, RIM_CAT, SIDE_CAT, blend_ref, load_refs, observe, ratio_color, save_ref
@@ -168,6 +169,26 @@ def best_detection(detections: list[Detection], label: str, frame_shape=None) ->
     return max(candidates, key=lambda d: d.confidence)
 
 
+def drum_inside_confirmed(last3: list, config: dict) -> tuple[bool, int | None]:
+    """Чи підтверджують останні спостереження барабана «кіт усередині»: (так/ні, довжина хвоста inside від litter_algo).
+    Основне — litter_algo (config drum_algo, за замовчуванням true); якщо він збійнув або вимкнений, діють старі NCC-ознаки
+    (друге значення тоді None). Кіт ззовні (cat_outside) блокує в обох режимах. Кожне спостереження має мати "frame"."""
+    if len(last3) < 2 or any(o["cat_outside"] for o in last3):
+        return False, None
+    if config.get("drum_algo", True):
+        run = drum_algo.inside_run(drum_algo.classes([o["frame"] for o in last3]))
+        if run is not None:
+            logging.getLogger(__name__).info("drum_algo: inside-хвіст %d з %d кадрів", run, len(last3))
+            return run > 0, run
+        logging.getLogger(__name__).warning("drum_algo збійнув, перевіряємо старими NCC-ознаками")
+    return (
+        last3[-1]["ncc"] < NCC_CAT
+        and sum(o["ncc"] < NCC_CAT for o in last3) >= 2
+        and sum(o["side"] < SIDE_CAT for o in last3) < 2
+        and sum(o.get("rim") is not None and o["rim"] < RIM_CAT for o in last3) < 2
+    ), None
+
+
 def drum_inside_check(frames: list, config: dict) -> dict | None:
     """Кіт сидить у барабані, хоч руху вже нема (камера його не бачить): ті самі критерії, що в кінці classify_frames,
     але на кількох свіжих кадрах без події. Повертає {"color", "frame"} або None."""
@@ -182,14 +203,7 @@ def drum_inside_check(frames: list, config: dict) -> dict | None:
         o["frame"] = f
         obs.append(o)
     last3 = obs[-3:]
-    if (
-        len(last3) >= 2
-        and last3[-1]["ncc"] < NCC_CAT
-        and sum(o["ncc"] < NCC_CAT for o in last3) >= 2
-        and not any(o["cat_outside"] for o in last3)
-        and sum(o["side"] < SIDE_CAT for o in last3) < 2
-        and sum(o.get("rim") is not None and o["rim"] < RIM_CAT for o in last3) < 2
-    ):
+    if drum_inside_confirmed(last3, config)[0]:
         return {"color": ratio_color([o["ratio"] for o in last3]), "frame": last3[-1]["frame"], "ncc": last3[-1]["ncc"]}
     return None
 
@@ -292,8 +306,10 @@ def classify_frames(frame_iter, config: dict, current_hour: int | None = None) -
 
         obs = observe(frame, refs)
         if obs:
-            obs.update(t=t, cat_outside=bool(cat_det) and not inside)
+            obs.update(t=t, cat_outside=bool(cat_det) and not inside, frame=frame)
             drum_obs.append(obs)
+            if len(drum_obs) > drum_algo.TAIL:
+                drum_obs[-drum_algo.TAIL - 1].pop("frame", None)   # кадри потрібні лише для останніх TAIL спостережень
             if obs["ncc"] >= REF_UPDATE_NCC and obs["side"] >= REF_UPDATE_NCC and blend_allowed():
                 blend_ref(refs[obs["mode"]], obs["cur"])
                 refs_dirty.add(obs["mode"])
@@ -392,23 +408,24 @@ def classify_frames(frame_iter, config: dict, current_hour: int | None = None) -
     # «Кіт всередині» — без YOLO: контури вікна барабана наприкінці події не схожі на порожній референс режиму,
     # а бічна смуга фасаду не закрита (інакше кіт стоїть ззовні перед барабаном).
     last3 = drum_obs[-3:]
-    if (
-        len(last3) >= 2
-        and last3[-1]["ncc"] < NCC_CAT
-        and sum(o["ncc"] < NCC_CAT for o in last3) >= 2
-        and not any(o["cat_outside"] for o in last3)
-        and sum(o["side"] < SIDE_CAT for o in last3) < 2
-        and sum(o.get("rim") is not None and o["rim"] < RIM_CAT for o in last3) < 2
-    ):
-        low_run = []
-        for o in reversed(drum_obs):
-            if o["ncc"] >= NCC_CAT:
-                break
-            low_run.append(o)
+    inside_ok, algo_run = drum_inside_confirmed(last3, config)
+    if inside_ok:
+        if algo_run is not None:
+            low_run = last3[::-1][:algo_run]   # хвіст кадрів, де litter_algo бачить кота всередині (від нового до старого)
+        else:
+            low_run = []
+            for o in reversed(drum_obs):
+                if o["ncc"] >= NCC_CAT:
+                    break
+                low_run.append(o)
         cat_seen = cat_frames > 0 or (
             drum_obs[0]["ncc"] >= NCC_CAT and any(o["ncc"] < NCC_CAT for o in drum_obs)
         )
-        if cat_seen or (len(low_run) >= 3 and last3[-1]["mode"] in ("irday", "ir")):
+        if algo_run is not None:
+            confirmed = cat_seen or (len(last3) == drum_algo.TAIL and algo_run == len(last3))   # без YOLO — лише коли inside усі TAIL кадрів
+        else:
+            confirmed = cat_seen or (len(low_run) >= 3 and last3[-1]["mode"] in ("irday", "ir"))
+        if confirmed:
             samples = episodes[-1]["brightness"] if episodes else all_brightness_samples
             color = label_color(statistics.median(samples)) if samples else "unknown"
             if color == "unknown":
