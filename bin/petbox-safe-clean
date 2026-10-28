@@ -253,7 +253,8 @@ def drum_ncc_gate(frames):
         log("NCC-перевірка барабана: для частини кадрів нема еталона режиму")
     return None
 
-ALGO_VETO = True       # вето litter_algo (28.10.2026): чистимо лише коли кожен кадр має клас clear; False — вимкнути вето
+ALGO_PRIMARY = True    # litter_algo — основна перевірка кадру (28.10.2026): чистимо лише коли кожен кадр має клас clear.
+                       # False — повернутися до старих перевірок (яскравість вікна judge + NCC барабана drum_ncc_gate)
 ALGO_DOUBT = ("near", "unknown", "error")   # сумнів: вікно порожнє, але корпус закритий / лоток не знайдено / збій; inside і blocking — тверда відмова
 ALGO_TEXT = {"inside": "кіт у барабані", "blocking": "кіт або людина перекриває вхід", "near": "корпус лотка чимось закритий",
              "unknown": "лоток не знайдено на кадрі", "error": "збій алгоритму"}
@@ -281,11 +282,11 @@ def algo_classes(frames):
             out.append("error")
     return out
 
-def algo_gate(frames):
-    """Вето: причина відмови, якщо хоч один кадр не clear, інакше None. Може лише додати відмову, дозволити нічого не може."""
-    if not ALGO_VETO:
+def algo_gate(frames, classes=None):
+    """Причина відмови, якщо хоч один кадр не clear, інакше None. Збій алгоритму = відмова. `classes` — уже пораховані класи."""
+    if not ALGO_PRIMARY:
         return None
-    bad = [c for c in algo_classes(frames) if c != "clear"]
+    bad = [c for c in (classes if classes is not None else algo_classes(frames)) if c != "clear"]
     if not bad:
         return None
     worst = next((c for c in ("inside", "blocking", "unknown", "near", "error") if c in bad), "error")
@@ -324,10 +325,10 @@ def busy_reason():
     frames = grab_frames()
     if not frames:
         return "не вдалося отримати кадр з камери"
-    why = drum_ncc_gate(frames)
-    if why:
-        return why
-    why = algo_gate(frames)
+    if ALGO_PRIMARY:
+        why = algo_gate(frames)
+    else:
+        why = drum_ncc_gate(frames)
     if why:
         return why
     from detect import detect
@@ -335,10 +336,11 @@ def busy_reason():
         for d in detect(f, 0.25):
             if d.label == "cat":
                 return f"YOLO бачить кота (впевненість {d.confidence:.2f})"
-        aligned, mode = aligned_mode(f)
-        why = judge(roi_brightness(aligned, mode), mode, calib)
-        if why:
-            return why[0]
+        if not ALGO_PRIMARY:
+            aligned, mode = aligned_mode(f)
+            why = judge(roi_brightness(aligned, mode), mode, calib)
+            if why:
+                return why[0]
     return None
 
 def telegram_photo(frame, caption):
@@ -489,15 +491,19 @@ def dry_run():
     mode = aligned[-1][1]
     cat_seen = any(d.label == "cat" for f in frames for d in detect(f, 0.25))
     b = float(np.median([roi_brightness(a, m) for a, m in aligned]))
-    ncc_why = drum_ncc_gate(frames)
-    if ncc_why:
-        verdict.append(ncc_why)
+    classes = algo_classes(frames) if ALGO_PRIMARY else []
+    algo_why = algo_gate(frames, classes) if ALGO_PRIMARY else drum_ncc_gate(frames)
+    if algo_why:
+        verdict.append(algo_why)
+    if ALGO_PRIMARY:
+        lines.append("litter_algo: " + ", ".join(classes))
     em = calib.get(mode, {}).get("empty", [])
     lines.append(f"режим камери: { {'ir': 'нічний (ІЧ)', 'irday': 'сірий денний (вікно/фасад ×100)'}.get(mode, 'кольоровий') }; YOLO: {'кіт є' if cat_seen else 'кота не видно'}; "
                  f"яскравість вікна {b:.0f}" + (f" (порожній {min(em, key=lambda e: abs(b - e)):.0f})" if em else " (еталона «порожньо» для цього режиму ще нема)"))
     if cat_seen:
         verdict.append("YOLO бачить кота")
-    verdict += judge(b, mode, calib)
+    if not ALGO_PRIMARY:
+        verdict += judge(b, mode, calib)
     head = "НЕ чистив би: " + ", ".join(verdict) if verdict else "ЧИСТИВ БИ (усе чисто)"
     caption = (f"🧪 Пробний режим, очищення НЕ запускалось\n{head}\n" + "\n".join(lines)
                + ("" if NO_QUESTION else "\n\nЧи було б ок почистити зараз? Відповідай «так» або «ні» (reply на це фото або просто текстом)"))
@@ -509,34 +515,6 @@ def dry_run():
     with open(QUESTIONS, "a") as f:   # відповісти «так/ні» можна на будь-яке фото, і на нічне теж
         f.write(json.dumps({"message_id": mid, "ts": int(time.time()), "verdict": "busy" if verdict else "clean",
                             "why": "; ".join(verdict), "frame": frame_path, "asked": not NO_QUESTION}) + "\n")
-    shadow_log(frame_path, "block" if verdict else "allow", "; ".join(verdict), mid)
-
-SHADOW_LOG = f"{HOME}/cat_detector/data/litter_shadow.jsonl"
-SHADOW_CLASS = {"clear": "clear ✅ (порожньо, чистити можна)", "near": "near ⚠️ (вікно порожнє, але корпус чимось закритий)",
-                "inside": "inside 🐱 (кіт у барабані)", "blocking": "blocking 🚫 (кіт/людина перекриває вхід)",
-                "unknown": "unknown ❓ (лоток не знайдено)", "error": "error ⚠️ (збій алгоритму)"}
-SHADOW_AGREE = {"agree": "згодні", "algo_stricter": "algo СУВОРІШИЙ (чинна дозволила, algo блокує)",
-                "algo_looser": "algo М'ЯКШИЙ (чинна заблокувала, algo дозволяє)", "no_current": "порівняти нема з чим"}
-
-def shadow_log(frame_path, current, reason, mid):
-    """Тіньовий режим litter_algo: ПІСЛЯ рішення рахує вердикт алгоритму, дописує його в data/litter_shadow.jsonl і
-    шле відповіддю на фото. Нічого не чистить і не блокує; будь-який збій ковтається, рішення назад не читається."""
-    try:
-        subprocess.run([sys.executable, "-m", "litter_algo.shadow", "--frame", frame_path, "--current", current,
-                        "--reason", reason, "--source", "petbox-safe-clean-dry-run"], cwd=f"{HOME}/cat_detector",
-                       stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=20)
-        rec = json.loads(open(SHADOW_LOG, encoding="utf-8").readlines()[-1])
-        if rec.get("frame") != frame_path:
-            return
-        nums = f" f={rec['f']:.2f} g={rec['g']:.2f}, пошук лотка {rec['score']:.2f}" if rec.get("f") is not None else ""
-        text = (f"🔬 litter_algo (тінь): {SHADOW_CLASS.get(rec.get('algo'), rec.get('algo'))}{nums}\n"
-                f"Чинна логіка: {'чистила б' if current == 'allow' else 'не чистила б'}, {SHADOW_AGREE.get(rec.get('agreement'), '')}")
-        env = dict(l.strip().split("=", 1) for l in open(CAM_ENV) if "=" in l and not l.startswith("#"))
-        data = json.dumps({"chat_id": env["TELEGRAM_CHAT_ID"], "text": text, "reply_to_message_id": mid}).encode()
-        urllib.request.urlopen(urllib.request.Request(f"https://api.telegram.org/bot{env['TELEGRAM_BOT_TOKEN']}/sendMessage",
-                               data=data, headers={"Content-Type": "application/json"}), timeout=20)
-    except Exception:
-        pass
 
 def bot_loop():
     """Довгий опитувальний цикл (long polling): Telegram відповідає одразу, щойно з'явилось повідомлення. Служба petbox-bot."""
