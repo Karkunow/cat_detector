@@ -5,6 +5,8 @@ import cv2
 import numpy as np
 
 from detect import Detection, detect
+from align_guard import blend_allowed
+from drum_check import align_with_shift, NCC_CAT, REF_UPDATE_NCC, RIM_CAT, SIDE_CAT, blend_ref, load_refs, observe, ratio_color, save_ref
 
 DAY_SATURATION_THRESHOLD = 20  # mean saturation below this => treated as IR/night frame
 
@@ -31,13 +33,34 @@ IR_DAY_WALL_MIN = 112  # у нічному ІЧ «стіна» ~98, у сіро�
 IR_DAY_THRESHOLDS = {"white_min": 0.55, "black_max": 0.50}  # 25-й перцентиль кота / фасад (медіана по подіях). Вночі: чорний 0.30–0.38, білий 0.54–0.66; вдень (відео 22.10): чорний 0.46–0.48, білий 0.62–0.85
 
 
-def wall_and_front(frame) -> tuple[float, float]:
-    """Яскравість стіни зліва і білого фасаду лотка (фіксовані ділянки кадру 1280x720)."""
+def wall_and_front(frame, shift=(0.0, 0.0)) -> tuple[float, float]:
+    """Яскравість стіни зліва і білого фасаду лотка (ділянки кадру 1280x720; shift — на скільки зсунулась камера від еталонного положення)."""
     g = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
     h, w = g.shape
-    wall = float(np.mean(g[int(.42 * h):int(.64 * h), int(.016 * w):int(.125 * w)]))
-    front = float(np.mean(g[int(.69 * h):int(.78 * h), int(.18 * w):int(.47 * w)]))
+    sx, sy = int(round(shift[0])), int(round(shift[1]))
+
+    def region(x1, y1, x2, y2):
+        x1, x2 = max(0, int(x1 * w) + sx), min(w, int(x2 * w) + sx)
+        y1, y2 = max(0, int(y1 * h) + sy), min(h, int(y2 * h) + sy)
+        return g[y1:y2, x1:x2] if x2 > x1 and y2 > y1 else g[0:1, 0:1]
+
+    wall = float(np.mean(region(.016, .42, .125, .64)))
+    front = float(np.mean(region(.18, .69, .47, .78)))
     return wall, front
+
+
+BRIGHT_PIXEL, BRIGHT_WHITE_FRAC = 150, 0.40  # білий кіт близько до камери пересвічений: ≥40% пікселів кота яскравіші за 150 (чорні в ІЧ: ≤28%)
+
+
+def bright_override(color: str, frame, bbox) -> str:
+    """Чорний за відношенням до фасаду, але кадр кота майже весь яскравий — це білий кіт (медіана по кадрах події тягнулась униз фоном)."""
+    if color == "white" or frame is None or bbox is None:
+        return color
+    v = cv2.cvtColor(crop_bbox(frame, bbox), cv2.COLOR_BGR2GRAY).ravel()
+    if v.size and float((v > BRIGHT_PIXEL).mean()) >= BRIGHT_WHITE_FRAC:
+        logging.getLogger(__name__).info(f"кіт на кадрі яскравий ({100 * float((v > BRIGHT_PIXEL).mean()):.0f}% пікселів >{BRIGHT_PIXEL}): {color} -> white")
+        return "white"
+    return color
 
 
 def classify_ir_day(brightness: float, front: float) -> str:
@@ -48,6 +71,20 @@ def classify_ir_day(brightness: float, front: float) -> str:
     if r <= IR_DAY_THRESHOLDS["black_max"]:
         return "black"
     return "unknown"
+
+
+def sun_is_up(now=None, lat=38.72, lon=-9.14):
+    """День/ніч за висотою сонця над Лісабоном (NOAA): ІЧ-режим камери вдень не означає ніч."""
+    import math
+    from datetime import datetime, timezone
+    t = (now or datetime.now(timezone.utc)).astimezone(timezone.utc)
+    g = 2 * math.pi / 365 * (t.timetuple().tm_yday - 1 + (t.hour - 12) / 24)
+    eq = 229.18 * (0.000075 + 0.001868 * math.cos(g) - 0.032077 * math.sin(g) - 0.014615 * math.cos(2 * g) - 0.040849 * math.sin(2 * g))
+    d = 0.006918 - 0.399912 * math.cos(g) + 0.070257 * math.sin(g) - 0.006758 * math.cos(2 * g) + 0.000907 * math.sin(2 * g) - 0.002697 * math.cos(3 * g) + 0.00148 * math.sin(3 * g)
+    ha = math.radians((t.hour * 60 + t.minute + eq + 4 * lon) / 4 - 180)
+    la = math.radians(lat)
+    elev = 90 - math.degrees(math.acos(math.sin(la) * math.sin(d) + math.cos(la) * math.cos(d) * math.cos(ha)))
+    return elev > -0.833
 
 
 def is_day_time(hour: int, day_start_hour: int = 7, day_end_hour: int = 21) -> bool:
@@ -131,6 +168,32 @@ def best_detection(detections: list[Detection], label: str, frame_shape=None) ->
     return max(candidates, key=lambda d: d.confidence)
 
 
+def drum_inside_check(frames: list, config: dict) -> dict | None:
+    """Кіт сидить у барабані, хоч руху вже нема (камера його не бачить): ті самі критерії, що в кінці classify_frames,
+    але на кількох свіжих кадрах без події. Повертає {"color", "frame"} або None."""
+    refs = load_refs()
+    obs = []
+    for f in frames:
+        o = observe(f, refs)
+        if o is None:
+            continue
+        cat_det = best_detection(detect(f, config["yolo_confidence"]), "cat", f.shape)
+        o["cat_outside"] = bool(cat_det) and not point_in_roi(bbox_center(cat_det.bbox), config["roi"], f.shape)
+        o["frame"] = f
+        obs.append(o)
+    last3 = obs[-3:]
+    if (
+        len(last3) >= 2
+        and last3[-1]["ncc"] < NCC_CAT
+        and sum(o["ncc"] < NCC_CAT for o in last3) >= 2
+        and not any(o["cat_outside"] for o in last3)
+        and sum(o["side"] < SIDE_CAT for o in last3) < 2
+        and sum(o.get("rim") is not None and o["rim"] < RIM_CAT for o in last3) < 2
+    ):
+        return {"color": ratio_color([o["ratio"] for o in last3]), "frame": last3[-1]["frame"], "ncc": last3[-1]["ncc"]}
+    return None
+
+
 def classify_frames(frame_iter, config: dict, current_hour: int | None = None) -> list[dict]:
     """Runs the full detect -> color/ROI/dwell pipeline over an iterable of (t, frame)
     pairs (t = seconds since the event started) and returns a list of result dicts:
@@ -163,6 +226,13 @@ def classify_frames(frame_iter, config: dict, current_hour: int | None = None) -
     gap_tolerance = config["dwell_gap_tolerance_seconds"]
     min_dwell = config["min_dwell_seconds"]
     max_visible_density = config.get("dwell_max_visible_density", 0.65)
+    hidden_s = config.get("inside_hidden_seconds", 4.0)
+    last_outside_t = -1.0
+    last_t = 0.0
+    last_frame = None
+    refs = load_refs()
+    refs_dirty = set()
+    drum_obs = []
     sample_interval = 1.0 / config["sample_fps"]
 
     day_votes = []
@@ -174,7 +244,9 @@ def classify_frames(frame_iter, config: dict, current_hour: int | None = None) -
     total_frames = 0
     max_conf = 0.0
     best_cat_frame = None
+    best_cat_bbox = None
     best_cat_conf = 0.0
+    cam_shift = None
 
     episodes: list[dict] = []
     current: dict | None = None
@@ -187,11 +259,15 @@ def classify_frames(frame_iter, config: dict, current_hour: int | None = None) -
 
     for t, frame in frame_iter:
         total_frames += 1
+        last_t, last_frame = t, frame
         if current_hour is None:
             day_votes.append(is_day_frame(frame))
         else:
             spreads.append(color_spread(frame))
-            wl, fr = wall_and_front(frame)
+            if cam_shift is None:
+                bases = [r["base"] for r in refs.values() if r.get("base")]
+                cam_shift = align_with_shift(frame, bases[0])[1] if bases else (0.0, 0.0)
+            wl, fr = wall_and_front(frame, cam_shift)
             walls.append(wl)
             fronts.append(fr)
         dets = detect(frame, config["yolo_confidence"])
@@ -210,6 +286,17 @@ def classify_frames(frame_iter, config: dict, current_hour: int | None = None) -
             if cat_det.confidence > best_cat_conf:
                 best_cat_conf = cat_det.confidence
                 best_cat_frame = frame
+                best_cat_bbox = cat_det.bbox
+            if not inside:
+                last_outside_t = t
+
+        obs = observe(frame, refs)
+        if obs:
+            obs.update(t=t, cat_outside=bool(cat_det) and not inside)
+            drum_obs.append(obs)
+            if obs["ncc"] >= REF_UPDATE_NCC and obs["side"] >= REF_UPDATE_NCC and blend_allowed():
+                blend_ref(refs[obs["mode"]], obs["cur"])
+                refs_dirty.add(obs["mode"])
 
         # Episode boundary: a gap since the cat was last confirmed inside the ROI
         # longer than gap_tolerance ends the current episode. A shorter gap is
@@ -231,22 +318,19 @@ def classify_frames(frame_iter, config: dict, current_hour: int | None = None) -
                     "brightness": [],
                     "best_conf": 0.0,
                     "best_frame": None,
+                    "best_bbox": None,
                 }
             current["last_inside_t"] = t
             current["brightness"].append(brightness)
             if cat_det.confidence > current["best_conf"]:
                 current["best_conf"] = cat_det.confidence
                 current["best_frame"] = frame
+                current["best_bbox"] = cat_det.bbox
 
     close_current()
 
     if current_hour is not None:
-        is_day = is_day_time(current_hour)
-        if spreads:
-            med = statistics.median(spreads)
-            logging.getLogger(__name__).info(f"color_spread median={med:.1f} (IR < {IR_SPREAD_THRESHOLD})")
-            if med < IR_SPREAD_THRESHOLD:
-                is_day = False  # камера в ІЧ-режимі — це ніч, хоч би що казав годинник
+        is_day = sun_is_up()
     else:
         is_day = (sum(day_votes) / len(day_votes)) >= 0.5 if day_votes else True
 
@@ -279,6 +363,10 @@ def classify_frames(frame_iter, config: dict, current_hour: int | None = None) -
             len(ep["brightness"]) * sample_interval / ep["dwell"] if ep["dwell"] > 0 else 1.0
         )
 
+    if config.get("drum_ref_update", True):
+        for mode in refs_dirty:
+            save_ref(mode, refs[mode])
+
     confirmed = [
         ep
         for ep in episodes
@@ -288,7 +376,7 @@ def classify_frames(frame_iter, config: dict, current_hour: int | None = None) -
         results = []
         for ep in confirmed:
             brightness = statistics.median(ep["brightness"])
-            label = label_color(brightness)
+            label = bright_override(label_color(brightness), ep["best_frame"], ep.get("best_bbox"))
             results.append(
                 {
                     "cat": label,
@@ -300,6 +388,44 @@ def classify_frames(frame_iter, config: dict, current_hour: int | None = None) -
                 }
             )
         return results
+
+    # «Кіт всередині» — без YOLO: контури вікна барабана наприкінці події не схожі на порожній референс режиму,
+    # а бічна смуга фасаду не закрита (інакше кіт стоїть ззовні перед барабаном).
+    last3 = drum_obs[-3:]
+    if (
+        len(last3) >= 2
+        and last3[-1]["ncc"] < NCC_CAT
+        and sum(o["ncc"] < NCC_CAT for o in last3) >= 2
+        and not any(o["cat_outside"] for o in last3)
+        and sum(o["side"] < SIDE_CAT for o in last3) < 2
+        and sum(o.get("rim") is not None and o["rim"] < RIM_CAT for o in last3) < 2
+    ):
+        low_run = []
+        for o in reversed(drum_obs):
+            if o["ncc"] >= NCC_CAT:
+                break
+            low_run.append(o)
+        cat_seen = cat_frames > 0 or (
+            drum_obs[0]["ncc"] >= NCC_CAT and any(o["ncc"] < NCC_CAT for o in drum_obs)
+        )
+        if cat_seen or (len(low_run) >= 3 and last3[-1]["mode"] in ("irday", "ir")):
+            samples = episodes[-1]["brightness"] if episodes else all_brightness_samples
+            color = label_color(statistics.median(samples)) if samples else "unknown"
+            if color == "unknown":
+                color = ratio_color([o["ratio"] for o in low_run])
+            ep = episodes[-1] if episodes else None
+            return [
+                {
+                    "cat": f"{color}_inside",
+                    "color": color,
+                    "is_day": is_day,
+                    "confidence": ep["best_conf"] if ep else max_conf,
+                    "dwell_seconds": last_t - low_run[-1]["t"],
+                    "confirmed_visit": False,
+                    "inside_now": True,
+                    "best_frame": ep["best_frame"] if ep and ep["best_frame"] is not None else last_frame,
+                }
+            ]
 
     if cat_frames == 0:
         return [
@@ -317,7 +443,7 @@ def classify_frames(frame_iter, config: dict, current_hour: int | None = None) -
     # "passed by" notification can be sent.
     best_dwell = max((ep["dwell"] for ep in episodes), default=0.0)
     brightness = statistics.median(all_brightness_samples)
-    color = label_color(brightness)
+    color = bright_override(label_color(brightness), best_cat_frame, best_cat_bbox)
     label = f"{color}_passby" if color != "unknown" else "pass_through"
     return [
         {

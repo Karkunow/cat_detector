@@ -1,0 +1,14 @@
+time	kind	cat	light	sd_seconds	note
+00:36	visit	black	night	98	
+00:39	passby	black	night	66	вистрибує з лотка після візиту; камера довго знімає сама
+01:30	passby	white	night	98	
+06:58	visit	white	night	144	
+14:37	passby	-	day	72	
+14:37	passby	-	day	70	
+14:48	visit	black	day	90	
+14:50	passby	black	day	64	вистрибує з коробки після візиту
+14:54	visit	white	day	146	
+15:09	passby	black	day	82	
+15:27	passby	white	day	92	
+17:15	passby	black	day	94	
+17:28	passby	black	day	64	

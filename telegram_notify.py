@@ -15,7 +15,7 @@ SEND_RETRIES = 2  # a live Wi-Fi hiccup has already caused a confirmed-visit pho
 RETRY_BACKOFF_SECONDS = 3
 
 CAT_EMOJI = {"white": "⬜", "black": "⬛"}
-CAT_LABEL_UK = {"white": "Білий", "black": "Чорний"}
+CAT_LABEL_UK = {"white": "Білий", "black": "Чорний", "unknown": "Колір невідомий"}
 
 
 def _post_with_retry(*args, **kwargs) -> requests.Response:
@@ -95,3 +95,15 @@ def notify_passby(cat: str, is_day: bool, frame=None) -> None:
     time_of_day = "вдень" if is_day else "вночі"
     text = f"{emoji} {label} кіт пройшов повз ({time_of_day}, до лотка не заходив)"
     _notify(text, frame)
+
+
+def notify_exit(cat: str, frame=None) -> None:
+    label = CAT_LABEL_UK.get(cat, cat)
+    emoji = CAT_EMOJI.get(cat, "🐾")
+    _notify(f"{emoji} {label} кіт вийшов з лотка", frame)
+
+
+def notify_inside(cat: str, frame=None) -> None:
+    label = CAT_LABEL_UK.get(cat, cat)
+    emoji = CAT_EMOJI.get(cat, "🐾")
+    _notify(f"{emoji} Кіт зайшов у лоток і сидить усередині ({label.lower()})", frame)

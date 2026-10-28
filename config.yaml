@@ -15,6 +15,8 @@ roi: [0.30, 0.05, 1.00, 0.65]
 
 min_dwell_seconds: 12
 dwell_max_visible_density: 0.65
+inside_hidden_seconds: 4.0
+inside_dedup_minutes: 10
 # Max fraction of an episode's span that may actually show a detected cat inside
 # the ROI for it to still count as a confirmed visit. A real visit is mostly
 # invisible (cat hidden inside the enclosed dome) -- calibrated real visits
@@ -63,3 +65,8 @@ thresholds:
 # Phase B additions (camera/telegram) go here once we get to live triggering:
 # rtsp_url: "rtsp://camuser:campass@<ip>:554/stream2"
 # telegram_bot_token / telegram_chat_id: kept in .env instead
+
+# Сторож положення камери (align_guard.py, план ~/cat_detector_autorecal_plan_2026-10-26.md). Зміна потребує перезапуску.
+align_guard: true      # true | false (YAML: on/off = булеве). false = поведінка як раніше; petbox-safe-clean тоді відмовляє: стан застарів
+align_notify: true     # повідомлення Славі в ~/outbox при LOST/довгому UNCERTAIN (не частіше 1 на 6 год, ≤3 на добу, не вночі)
+align_promote: manual  # manual = лише збирає кандидатів (data/refs_cand) і логує консенсус; auto = ще й автопромоція (потребує окремого рішення Слави); off = нічого не знімати

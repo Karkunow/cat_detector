@@ -1,0 +1,24 @@
+time	truth	cat	note
+00:29	passby	white	проходив білий кіт
+02:27	passby	none	людина
+02:29	passby	none	людина (відео давало зайнято 21 с)
+02:34	visit	black	вірно
+02:37	passby	black	вірно
+02:37:33	passby	black	кіт всередині пару секунд
+02:39:21	visit	white	
+02:40:47	visit	white	
+02:41:45	quiet	none	нікого не було
+02:43:11	passby	black	вірно
+03:11:39	passby	black	заліз наполовину, постояв, пішов (21 с зайнято); це прохід
+03:28:47	cleaning_cycle	none	очистка лотка; всередині нікого; є звуковий сигнал старту мотора
+08:16:29	visit	white	вірно
+08:18:09	passby	white	вистрибнув з лотка (кінець візиту)
+08:45:37	passby	white	у лотку всередині не був, просто прохід (відео давало зайнято 6 с)
+14:40:41	passby	white	
+16:21:23	visit	white	у записі ще й чорний пройшов повз
+16:40:15	passby	white	
+18:28:15	cleaning_cycle	none	людина запустила очистку; всередині нікого
+18:53:11	passby	white	
+19:00:15	passby	white	
+23:52:50	visit	white	
+23:54:48	passby	white	вилазив з лотка (кінець візиту)

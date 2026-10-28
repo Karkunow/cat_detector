@@ -17,3 +17,12 @@ data/frames/
 run.log
 install.log
 data/litter_shadow.jsonl
+
+# локальні резервні копії правок
+*.bak-*
+*.bak
+*.throttled-*
+# відео/кадри/еталони камери (публічний репозиторій)
+data/clips/
+data/refs_bak_*/
+data/drum_ref_*.npy

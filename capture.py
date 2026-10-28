@@ -6,6 +6,7 @@ to the camera's ONVIF PullPoint event source and only open the RTSP stream while
 motion event is active.
 """
 
+import re
 import asyncio
 import datetime as dt
 import logging
@@ -75,7 +76,7 @@ class MotionCapture:
             cap.set(cv2.CAP_PROP_READ_TIMEOUT_MSEC, RTSP_READ_TIMEOUT_MS)
             cap.open(self.rtsp_url)
             if not cap.isOpened():
-                logger.error("Failed to open RTSP stream at %s, retrying in %ss", self.rtsp_url, RECONNECT_BACKOFF)
+                logger.error("Failed to open RTSP stream at %s, retrying in %ss", re.sub(r"//[^@/]*@", "//***@", self.rtsp_url), RECONNECT_BACKOFF)
                 cap.release()
                 time.sleep(RECONNECT_BACKOFF)
                 continue
@@ -109,6 +110,15 @@ class MotionCapture:
     def start_event(self) -> None:
         with self._lock:
             self._event_frames = list(self._ring_buffer)
+
+    def latest_frames(self, n: int, max_age: float = 3.0) -> list:
+        """Останні n кадрів із буфера (лише коли немає активної події і потік свіжий), інакше порожньо."""
+        with self._lock:
+            if self._event_frames is not None or not self._ring_buffer:
+                return []
+            if time.monotonic() - self._ring_buffer[-1][0] > max_age:
+                return []
+            return [f for _, f in list(self._ring_buffer)[-n:]]
 
     def stop_event(self) -> list[tuple[float, "cv2.Mat"]]:
         with self._lock:
