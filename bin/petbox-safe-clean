@@ -498,14 +498,15 @@ def dry_run():
     if ALGO_PRIMARY:
         lines.append("litter_algo: " + ", ".join(classes))
     em = calib.get(mode, {}).get("empty", [])
-    lines.append(f"режим камери: { {'ir': 'нічний (ІЧ)', 'irday': 'сірий денний (вікно/фасад ×100)'}.get(mode, 'кольоровий') }; YOLO: {'кіт є' if cat_seen else 'кота не видно'}; "
-                 f"яскравість вікна {b:.0f}" + (f" (порожній {min(em, key=lambda e: abs(b - e)):.0f})" if em else " (еталона «порожньо» для цього режиму ще нема)"))
+    lines.append(f"режим камери: { {'ir': 'нічний (ІЧ)', 'irday': 'сірий денний (вікно/фасад ×100)'}.get(mode, 'кольоровий') };")
+    lines.append(f"YOLO: {'кіт є' if cat_seen else 'кота не видно'}; яскравість вікна {b:.0f}"
+                 + (f" (порожній {min(em, key=lambda e: abs(b - e)):.0f})" if em else ""))
     if cat_seen:
         verdict.append("YOLO бачить кота")
     if not ALGO_PRIMARY:
         verdict += judge(b, mode, calib)
     head = "НЕ чистив би: " + ", ".join(verdict) if verdict else "ЧИСТИВ БИ (усе чисто)"
-    caption = (f"🧪 Пробний режим, очищення НЕ запускалось\n{head}\n" + "\n".join(lines)
+    caption = (f"🧪{head}\n" + "\n".join(lines)
                + ("" if NO_QUESTION else "\n\nЧи було б ок почистити зараз? Відповідай «так» або «ні» (reply на це фото або просто текстом)"))
     log(caption.replace("\n", " | "))
     mid = telegram_photo(frames[-1], caption)
