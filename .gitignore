@@ -16,3 +16,4 @@ yolov8n.pt
 data/frames/
 run.log
 install.log
+data/litter_shadow.jsonl
