@@ -10,11 +10,26 @@ import threading
 
 logger = logging.getLogger(__name__)
 
+SOFT_CELL_MIN = 0.40   # litter_algo.classify.CELL_MIN = 0.45: кіт у вікні з цілою рамкою й клітинками 0.40–0.45 — це «усередині» (порожній лоток теж дає 0.43–0.46)
 TAIL = 3         # скільки останніх кадрів дивимось
 MIN_INSIDE = 2   # скільки з них (разом з останнім) мають бути inside
 
 _lock = threading.Lock()    # Locator тримає стан між викликами (_last), а classify і recheck ідуть з різних потоків
 _locator = None
+
+
+def soften(cls: str, window_verdict: str, cells, rim) -> str:
+    """Для сповіщення (не для чистки) «blocking» через клітинки корпусу трохи нижче порога CELL_MIN, коли вікно зайняте, а рамка
+    входу ціла (min >= RIM_MIN), вважаємо «inside»: кіт сидить у вікні (29.10 00:17 білий, клітинки 0.43; 28.10 07:38, 0.43).
+    Закриту рамку чи клітинки сильно нижче порога (кіт ззовні перед лотком: 0.0–0.35) це не стосується."""
+    if cls != "blocking" or window_verdict != "occupied":
+        return cls
+    from litter_algo.classify import RIM_MIN
+    rims = [r for r in (rim or []) if r is not None]
+    body = [c for c in (cells or []) if c is not None]
+    if rims and min(rims) >= RIM_MIN and body and min(body) >= SOFT_CELL_MIN:
+        return "inside"
+    return cls
 
 
 def classes(frames: list) -> list[str]:
@@ -34,7 +49,7 @@ def classes(frames: list) -> list[str]:
             try:
                 a = _locator.analyze(f)
                 wv, _, _ = verdict(a)
-                out.append(decide(wv, a["cells"], a["rim"]))
+                out.append(soften(decide(wv, a["cells"], a["rim"]), wv, a["cells"], a["rim"]))
             except Exception as e:
                 logger.error("drum_algo: збій на кадрі (%s: %s)", type(e).__name__, e)
                 out.append("error")
