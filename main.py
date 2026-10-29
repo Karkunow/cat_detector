@@ -209,7 +209,7 @@ async def main() -> None:
             if capturing:
                 return
             frames = grabber.latest_frames(3)
-            if frames and await asyncio.to_thread(person_present, frames, 0.25, 1):
+            if frames and config.get("person_filter", False) and await asyncio.to_thread(person_present, frames, 0.25, 1):
                 logger.info("Inside recheck: у кадрі людина, мовчимо")
                 return
             res = await asyncio.to_thread(drum_inside_check, frames, config) if frames else None
@@ -266,7 +266,7 @@ async def main() -> None:
             if event_end is not None:
                 asyncio.create_task(save_post_context(event_dir, event_end))
             results = await asyncio.to_thread(classify_frames, frames, config, now.hour)
-            human = await asyncio.to_thread(person_present, [f for _, f in frames])
+            human = config.get("person_filter", False) and await asyncio.to_thread(person_present, [f for _, f in frames])
             timestamp = now.isoformat()
             for result in results:
                 storage.insert_event(

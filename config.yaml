@@ -5,6 +5,9 @@ sample_fps: 4          # how many frames per second to sample from each clip.
 # 2fps samples) and after switching to a persistent RTSP connection made extra
 # samples cheap (no longer paying per-event connection latency).
 yolo_confidence: 0.4
+# YOLO person filter (silences cat notifications when a person is in the event frames) is off:
+# it fired on a white cat in IR frames at 2026-10-29 00:16-00:54 and no photos were sent. true re-enables it.
+person_filter: false
 
 # ROI = litter box entrance area, as fractions [x1, y1, x2, y2] of frame width/height.
 # Calibrated from data/calibration crops: camera is mounted right at the box entrance,
