@@ -53,9 +53,14 @@ def wall_and_front(frame, shift=(0.0, 0.0)) -> tuple[float, float]:
 BRIGHT_PIXEL, BRIGHT_WHITE_FRAC = 150, 0.35  # білий кіт близько до камери пересвічений: ≥35% пікселів кота яскравіші за 150 (чорні в ІЧ: ≤28%); було 0.40, 29.10 00:34 білий мав 39% і став «чорним»
 
 
-def bright_override(color: str, frame, bbox) -> str:
+BRIGHT_MIN_RATIO = 0.40  # кіт темніший за 0.40 фасаду — чорний напевно (чорний 0.23–0.38, білий ≥0.54): яскраві пікселі в рамці — це білий лоток за ним; 29.10 01:07 чорний (0.23) став «білим»
+
+
+def bright_override(color: str, frame, bbox, ratio: float | None = None) -> str:
     """Чорний за відношенням до фасаду, але кадр кота майже весь яскравий — це білий кіт (медіана по кадрах події тягнулась униз фоном)."""
     if color == "white" or frame is None or bbox is None:
+        return color
+    if ratio is not None and ratio < BRIGHT_MIN_RATIO:
         return color
     v = cv2.cvtColor(crop_bbox(frame, bbox), cv2.COLOR_BGR2GRAY).ravel()
     if v.size and float((v > BRIGHT_PIXEL).mean()) >= BRIGHT_WHITE_FRAC:
@@ -392,7 +397,7 @@ def classify_frames(frame_iter, config: dict, current_hour: int | None = None) -
         results = []
         for ep in confirmed:
             brightness = statistics.median(ep["brightness"])
-            label = bright_override(label_color(brightness), ep["best_frame"], ep.get("best_bbox"))
+            label = bright_override(label_color(brightness), ep["best_frame"], ep.get("best_bbox"), brightness / max(front, 1.0))
             results.append(
                 {
                     "cat": label,
@@ -460,7 +465,7 @@ def classify_frames(frame_iter, config: dict, current_hour: int | None = None) -
     # "passed by" notification can be sent.
     best_dwell = max((ep["dwell"] for ep in episodes), default=0.0)
     brightness = statistics.median(all_brightness_samples)
-    color = bright_override(label_color(brightness), best_cat_frame, best_cat_bbox)
+    color = bright_override(label_color(brightness), best_cat_frame, best_cat_bbox, brightness / max(front, 1.0))
     label = f"{color}_passby" if color != "unknown" else "pass_through"
     return [
         {
