@@ -19,7 +19,7 @@ import align_guard as ag
 import storage
 import telegram_notify
 from capture import MotionCapture, watch_motion_events
-from classify import classify_frames, drum_inside_check
+from classify import classify_frames, drum_inside_check, is_day_time
 from detect import detect, person_present
 
 CONFIG_PATH = Path(__file__).parent / "config.yaml"
@@ -222,6 +222,16 @@ async def main() -> None:
                 color = res["color"]
             ts = time.time()
             last_visit = (ts, color)
+            # Рядок у events.db, як у гілці inside_now: автоочищення рахує візитом лише не-passby рядок, а тут
+            # раніше писався тільки passby, тож «сидить усередині» лишалось для нього невидимим.
+            storage.insert_event(
+                conn,
+                timestamp=datetime.fromtimestamp(ts).isoformat(),
+                cat=f"{color}_inside",
+                is_day=is_day_time(datetime.fromtimestamp(ts).hour),
+                dwell_seconds=0.0,
+                source_clip="live",
+            )
             if inside_since and inside_since[1] == color and ts - inside_since[0] < config.get("inside_dedup_minutes", 10) * 60:
                 return
             inside_since = (ts, color)
