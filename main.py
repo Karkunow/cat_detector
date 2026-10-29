@@ -48,6 +48,13 @@ def cleanup_event_frames(now_ts: float, keep_days: int = 3) -> None:
             shutil.rmtree(old) if old.is_dir() else old.unlink()
 
 
+def person_blocks(result: dict, human: bool) -> bool:
+    """«Людина в кадрі» глушить сповіщення, окрім випадку, коли класифікатор упевнено бачить кота: білого кота впритул до
+    камери YOLO часом приймає за людину (conf до 0.73, рамка людини без рамки кота), і сповіщення про справжнього кота губились."""
+    cat_seen = result["cat"].startswith(("white", "black")) and (result.get("confidence") or 0.0) >= 0.5
+    return human and not cat_seen
+
+
 def save_event_frames(frames, now, step: int = 2) -> None:
     """Кожна подія камери лишає кожен step-й кадр (і останній) у data/frames/events/<мітка>/<індекс>.jpg (навіть без кота
     в кадрі) — для калібрування й тестів: кіт у барабані YOLO не бачить. t кадру = індекс / sample_fps. Старе чистимо раз на добу."""
@@ -264,9 +271,11 @@ async def main() -> None:
                     cv2.imwrite(str(frames_dir / f"{now:%Y%m%d-%H%M%S}-{result['cat']}.jpg"), frame)
                 loggable = {k: v for k, v in result.items() if k != "best_frame"}
                 logger.info("Event classified: %s (photo: %s)", loggable, frame is not None)
-                if human:
+                if human and person_blocks(result, human):
                     logger.info("У кадрі події людина, сповіщення про кота не шлемо")
                     continue
+                if human:
+                    logger.info("У кадрі події «людина», але кота розпізнано впевнено (%s) — шлемо як зазвичай", result["cat"])
 
                 ts = now.timestamp()
                 if last_visit and ts - last_visit[0] > config.get("exit_window_minutes", 4) * 60:
