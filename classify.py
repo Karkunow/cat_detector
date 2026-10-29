@@ -50,7 +50,7 @@ def wall_and_front(frame, shift=(0.0, 0.0)) -> tuple[float, float]:
     return wall, front
 
 
-BRIGHT_PIXEL, BRIGHT_WHITE_FRAC = 150, 0.40  # білий кіт близько до камери пересвічений: ≥40% пікселів кота яскравіші за 150 (чорні в ІЧ: ≤28%)
+BRIGHT_PIXEL, BRIGHT_WHITE_FRAC = 150, 0.35  # білий кіт близько до камери пересвічений: ≥35% пікселів кота яскравіші за 150 (чорні в ІЧ: ≤28%); було 0.40, 29.10 00:34 білий мав 39% і став «чорним»
 
 
 def bright_override(color: str, frame, bbox) -> str:
