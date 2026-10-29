@@ -8,7 +8,7 @@ CREATE TABLE IF NOT EXISTS events (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     timestamp TEXT NOT NULL,
     source_clip TEXT,
-    cat TEXT NOT NULL,          -- white | black | white_passby | black_passby | pass_through | unknown
+    cat TEXT NOT NULL,          -- white | black | white_passby | black_passby | pass_through | unknown | cleaning (box's own cleaning cycle)
     is_day INTEGER NOT NULL,    -- 1 = day, 0 = night
     confidence REAL,
     dwell_seconds REAL,

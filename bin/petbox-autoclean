@@ -75,7 +75,7 @@ def last_events():
         r = db.execute(sql).fetchone()
         return datetime.fromisoformat(r[0]).timestamp() if r else None   # timestamp у events.db — локальний час (Лісабон)
     anyev = ts("select timestamp from events order by id desc limit 1")
-    visit = ts("select timestamp from events where cat not like '%passby%' and cat != 'pass_through' order by id desc limit 1")
+    visit = ts("select timestamp from events where cat not like '%passby%' and cat not in ('pass_through', 'cleaning') order by id desc limit 1")
     return anyev, visit
 
 def tg_env():

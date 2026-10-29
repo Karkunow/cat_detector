@@ -16,10 +16,11 @@ from dotenv import load_dotenv
 from urllib.parse import quote
 
 import align_guard as ag
+import cleaning
 import storage
 import telegram_notify
 from capture import MotionCapture, watch_motion_events
-from classify import classify_frames, drum_inside_check
+from classify import classify_frames, drum_inside_check, is_day_time
 from detect import detect, person_present
 
 CONFIG_PATH = Path(__file__).parent / "config.yaml"
@@ -238,7 +239,12 @@ async def main() -> None:
         try:
             now = datetime.now()
             save_event_frames(frames, now)
-            results = await asyncio.to_thread(classify_frames, frames, config, now.hour)
+            event_end = now.timestamp()
+            if await asyncio.to_thread(cleaning.is_cleaning_event, event_end - coalesce_gap - frames[-1][0], event_end):
+                logger.info("Event is cleaning-cycle motion, not a cat")
+                results = [{"cat": "cleaning", "is_day": is_day_time(now.hour), "confidence": 1.0, "dwell_seconds": 0.0}]
+            else:
+                results = await asyncio.to_thread(classify_frames, frames, config, now.hour)
             human = await asyncio.to_thread(person_present, [f for _, f in frames])
             timestamp = now.isoformat()
             for result in results:
