@@ -331,16 +331,17 @@ def busy_reason():
         why = drum_ncc_gate(frames)
     if why:
         return why
+    if ALGO_PRIMARY:
+        return None   # кота в лотку й біля нього ловить litter_algo (inside/blocking/near); YOLO не потрібен
     from detect import detect
     for f in frames:
         for d in detect(f, 0.25):
             if d.label == "cat":
                 return f"YOLO бачить кота (впевненість {d.confidence:.2f})"
-        if not ALGO_PRIMARY:
-            aligned, mode = aligned_mode(f)
-            why = judge(roi_brightness(aligned, mode), mode, calib)
-            if why:
-                return why[0]
+        aligned, mode = aligned_mode(f)
+        why = judge(roi_brightness(aligned, mode), mode, calib)
+        if why:
+            return why[0]
     return None
 
 def telegram_photo(frame, caption):
@@ -485,11 +486,13 @@ def dry_run():
         log("камера не віддала кадр")
         notify("Пробне очищення: камера не віддала кадр")
         return
-    from detect import detect
     calib = load_calib()
     aligned = [aligned_mode(f) for f in frames]
     mode = aligned[-1][1]
-    cat_seen = any(d.label == "cat" for f in frames for d in detect(f, 0.25))
+    cat_seen = False
+    if not ALGO_PRIMARY:
+        from detect import detect
+        cat_seen = any(d.label == "cat" for f in frames for d in detect(f, 0.25))
     b = float(np.median([roi_brightness(a, m) for a, m in aligned]))
     classes = algo_classes(frames) if ALGO_PRIMARY else []
     algo_why = algo_gate(frames, classes) if ALGO_PRIMARY else drum_ncc_gate(frames)
@@ -499,7 +502,7 @@ def dry_run():
         lines.append("litter_algo: " + ", ".join(classes))
     em = calib.get(mode, {}).get("empty", [])
     lines.append(f"режим камери: { {'ir': 'нічний (ІЧ)', 'irday': 'сірий денний (вікно/фасад ×100)'}.get(mode, 'кольоровий') };")
-    lines.append(f"YOLO: {'кіт є' if cat_seen else 'кота не видно'}; яскравість вікна {b:.0f}"
+    lines.append((f"YOLO: {'кіт є' if cat_seen else 'кота не видно'}; " if not ALGO_PRIMARY else "") + f"яскравість вікна {b:.0f}"
                  + (f" (порожній {min(em, key=lambda e: abs(b - e)):.0f})" if em else ""))
     if cat_seen:
         verdict.append("YOLO бачить кота")
