@@ -42,6 +42,10 @@ def compare(crop):
 CELL_MIN = 0.45   # найгірша з 8 клітинок корпусу лотка (NCC контурів із шаблоном): нижче — корпус закритий (кіт/ноги перед лотком)
 
 
+SOFT_CELL = 2     # клітинка №2 (верхній правий кут ref_box.jpg; індекс з 0) на порожньому лотку балансує на 0.43–0.46 (хибні near 28–30.10.2026):
+SOFT_CELL_MIN = 0.35   # для near вона вважається закритою лише нижче цього порога; решта клітинок — за CELL_MIN. На мітках 28.10 жоден near не тримався на ній самій.
+                       # Індекс прив'язаний до шаблону ref_box.jpg: після його перезйомки перевірити заново.
+
 RIM_MIN = 0.25    # найгірша з 4 смуг рамки входу (NCC контурів із шаблоном): вище — рамка видна, кіт за нею = всередині
 
 
@@ -59,7 +63,10 @@ def decide(window_verdict, cells, rim=None):
     if window_verdict != "empty":
         return window_verdict
     vals = [c for c in (cells or []) if c is not None]
-    return "clear" if vals and min(vals) >= CELL_MIN else "near"
+    if not vals:
+        return "near"
+    closed = any(c is not None and c < (SOFT_CELL_MIN if i == SOFT_CELL else CELL_MIN) for i, c in enumerate(cells))
+    return "near" if closed else "clear"
 
 
 def verdict(analysis):

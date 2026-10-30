@@ -23,6 +23,15 @@ class TestDecideOnLabels(unittest.TestCase):
         self._check("clear", "clear")
         self._check("near", "near")
 
+    def test_corner_cell_alone_is_not_near(self):
+        """30.10.2026: порожній лоток, клітинка №2 = 0.43 (решта ≥0.5) — clear; та сама на 0.30 або інша клітинка на 0.43 — near."""
+        ok = [0.91, 0.93, 0.43, 0.83, 0.88, 0.81, 0.87, 0.69]
+        self.assertEqual(decide("empty", ok, None), "clear")
+        self.assertEqual(decide("empty", ok[:2] + [0.30] + ok[3:], None), "near")
+        self.assertEqual(decide("empty", [0.43] + ok[1:2] + [0.9] + ok[3:], None), "near")
+        self.assertEqual(decide("empty", ok[:5] + [0.43] + ok[6:], None), "near")
+        self.assertEqual(decide("occupied", ok, [0.5] * 4), "blocking")
+
     def test_blocking_and_inside(self):
         self._check("blocking", "blocking")
         self._check("inside_blk", "blocking")   # Слава перекладав з inside: кіт ззовні, корпус закритий
