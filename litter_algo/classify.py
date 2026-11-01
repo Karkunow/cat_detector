@@ -9,26 +9,53 @@
 Неоднозначність завжди в бік відмови: чистка дозволяється тільки за «empty» (+ окремі перевірки руху/запису/workstatus).
 """
 import os
+import time
 
 import numpy as np
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 MIN_LOCATE = 0.25
 DIFF, F_MAX, G_MAX = 0.12, 0.10, 0.22
+LIB = os.path.join(HERE, "empty_exemplars.npz")
+RELOAD_EVERY = 60   # раз на стільки секунд дивимось, чи не оновили бібліотеку еталонів (add_empty.py)
 
 
 def _library():
-    return np.load(os.path.join(HERE, "empty_exemplars.npz"))["ex"].astype(np.float32)
+    return np.load(LIB)["ex"].astype(np.float32)
 
 
 _EX = None
+_EX_MTIME = None
+_EX_CHECKED = 0.0
+
+
+def library():
+    """Бібліотека порожніх еталонів із самоперечитуванням: еталони, додані add_empty.py збоку, живі служби
+    підхоплюють самі — інакше їх не видно до перезапуску, бо _EX лишається в пам'яті процесу
+    (так само, як Locator стежить за появою нових ref_box*.jpg). Бита чи недописана бібліотека перевірку
+    не ламає: лишаємось на тій, що вже завантажена."""
+    global _EX, _EX_MTIME, _EX_CHECKED
+    now = time.time()
+    if _EX is not None and now - _EX_CHECKED < RELOAD_EVERY:
+        return _EX
+    _EX_CHECKED = now
+    try:
+        m = os.path.getmtime(LIB)
+    except OSError:
+        m = None
+    if _EX is None or (m is not None and m != _EX_MTIME):
+        try:
+            _EX = _library()
+            _EX_MTIME = m
+        except Exception:
+            if _EX is None:
+                raise
+    return _EX
 
 
 def compare(crop):
     """(f, g) відносно найближчого порожнього еталона; crop = 48x64, яскравість/яскравість корпусу."""
-    global _EX
-    if _EX is None:
-        _EX = _library()
+    _EX = library()
     c = crop / max(float(np.median(crop)), 1e-3)
     best = (9.0, 9.0)
     for e in _EX:
@@ -45,9 +72,7 @@ LOW_F_MIN = 0.30           # f нижньої третини для «inside» �
 
 def low_f(crop):
     """Частка пікселів нижньої третини вікна, що відрізняються від найближчого порожнього еталона (той самий DIFF)."""
-    global _EX
-    if _EX is None:
-        _EX = _library()
+    _EX = library()
     c = crop / max(float(np.median(crop)), 1e-3)
     return min(float((np.abs(c[LOW_ROWS] - e[LOW_ROWS]) > DIFF).mean()) for e in _EX)
 
