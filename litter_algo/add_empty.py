@@ -24,7 +24,7 @@ import shutil
 import cv2
 import numpy as np
 
-from .classify import DIFF, F_MAX, G_MAX, MIN_LOCATE, compare, decide
+from .classify import DIFF, F_MAX, G_MAX, MIN_LOCATE, TOP_ROWS, compare, decide, window_state
 from .locate import HERE, Locator
 
 LIB = os.path.join(HERE, "empty_exemplars.npz")
@@ -52,14 +52,16 @@ def _library():
 
 
 def verdict_with(ex, crop):
-    """(f, g) кропа відносно бібліотеки ex."""
+    """(f, g, f_top) кропа відносно бібліотеки ex. f, g — по всьому вікну (від найближчого за f еталона),
+    f_top — окремий мінімум по верхніх 2/3, як у classify.top_f."""
     best = (9.0, 9.0)
     for e in ex:
         df = np.abs(crop - e)
         f = float((df > DIFF).mean())
         if f < best[0]:
             best = (f, float(df.reshape(3, 16, 4, 16).mean(axis=(1, 3)).max()))
-    return best
+    ftop = min(float((np.abs(crop[TOP_ROWS] - e[TOP_ROWS]) > DIFF).mean()) for e in ex)
+    return best[0], best[1], ftop
 
 
 def labelled(limit):
@@ -92,8 +94,8 @@ def validate(ex_old, ex_new, loc, log=print):
         c, why, a = crop_of(fr, loc)
         if c is None:
             continue
-        f, g = verdict_with(ex_new, c)
-        wv = "empty" if f <= F_MAX and g <= G_MAX else "occupied"
+        f, g, ftop = verdict_with(ex_new, c)
+        wv = window_state(f, g, ftop)
         if decide(wv, a["cells"], a["rim"], a["crop"]) == "clear":
             bad += 1
             log("  УВАГА: з кандидатом кадр із котом став clear: %s (f=%.3f)" % (p, f))
@@ -108,8 +110,8 @@ def validate(ex_old, ex_new, loc, log=print):
             c, why, a = crop_of(fr, loc)
             if c is None:
                 continue
-            f, g = verdict_with(ex, c)
-            wv = "empty" if f <= F_MAX and g <= G_MAX else "occupied"
+            f, g, ftop = verdict_with(ex, c)
+            wv = window_state(f, g, ftop)
             n += decide(wv, a["cells"], a["rim"], a["crop"]) == "clear"
         return n
 
@@ -155,15 +157,15 @@ def main(argv=None):
         c, why, an = crop_of(fr, loc)
         if c is None:
             raise SystemExit("%s: %s" % (p, why))
-        f, g = verdict_with(ex_old, c)
-        cls = decide("empty" if f <= F_MAX and g <= G_MAX else "occupied", an["cells"], an["rim"], an["crop"])
-        print("%s: score=%.2f f=%.3f g=%.3f клас зараз=%s" % (os.path.basename(p), an["score"], f, g, cls))
+        f, g, ftop = verdict_with(ex_old, c)
+        cls = decide(window_state(f, g, ftop), an["cells"], an["rim"], an["crop"])
+        print("%s: score=%.2f f=%.3f g=%.3f f_top=%.3f клас зараз=%s" % (os.path.basename(p), an["score"], f, g, ftop, cls))
         new.append(c)
         names.append(os.path.abspath(p))
         t = cv2.resize(np.clip(c * 110, 0, 255).astype(np.uint8), (192, 144), interpolation=cv2.INTER_NEAREST)
         t = cv2.cvtColor(t, cv2.COLOR_GRAY2BGR)
         t = np.vstack([t, np.zeros((26, 192, 3), np.uint8)])
-        cv2.putText(t, "f=%.3f %s" % (f, os.path.basename(os.path.dirname(p))[:13]), (3, 164), 0, 0.38, (0, 255, 255), 1)
+        cv2.putText(t, "f_top=%.3f %s" % (ftop, os.path.basename(os.path.dirname(p))[:11]), (3, 164), 0, 0.38, (0, 255, 255), 1)
         tiles.append(t)
     cv2.imwrite(a.check, np.hstack(tiles))
     print("смужка для перевірки очима:", a.check)

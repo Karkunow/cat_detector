@@ -4,6 +4,7 @@ import json
 import os
 import unittest
 
+from litter_algo import classify as C
 from litter_algo.classify import decide
 
 LABELS = json.load(open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "labels_2026-10-28.json")))
@@ -65,6 +66,32 @@ class TestDecideOnLabels(unittest.TestCase):
     def test_nothing_occupied_becomes_clear(self):
         bad = [n for n, v in LABELS.items() if v["label"] in ("inside_ok", "inside_blk", "blocking", "inside_empty") and _got(n) == "clear"]
         self.assertEqual(bad, [])
+
+
+class WindowState(unittest.TestCase):
+    """Правило «вікно порожнє» рішають верхні 2/3 (01.11.2026): нижня смуга — сітка й пісок, вона пливе
+    після кожного візиту й тримала f порожнього лотка рівно на порозі."""
+
+    def test_top_decides_not_bottom(self):
+        # саме випадок 19:27: усе вікно трохи за порогом (0.104), а верхні 2/3 чисті
+        self.assertEqual(C.window_state(f=0.104, g=0.090, ftop=0.021), "empty")
+
+    def test_dirty_top_blocks(self):
+        # кіт у барабані: f_top на розмітці >= 0.229, тобто далеко за порогом
+        self.assertEqual(C.window_state(f=0.55, g=0.49, ftop=0.46), "occupied")
+
+    def test_whole_window_still_capped(self):
+        # навіть із чистим верхом усе вікно не може відрізнятись як завгодно сильно
+        self.assertEqual(C.window_state(f=0.40, g=0.10, ftop=0.02), "occupied")
+
+    def test_g_still_blocks(self):
+        self.assertEqual(C.window_state(f=0.05, g=0.30, ftop=0.02), "occupied")
+
+    def test_none_is_refusal(self):
+        self.assertEqual(C.window_state(f=None, g=None, ftop=None), "occupied")
+
+    def test_top_rows_are_two_thirds(self):
+        self.assertEqual((C.TOP_ROWS.start, C.TOP_ROWS.stop), (0, 32))
 
 
 if __name__ == "__main__":
