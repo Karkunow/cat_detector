@@ -6,7 +6,7 @@
 # Фото в Telegram: до (перед рішенням), на старті (знімається перед командою запуску й зберігається на диск), після очищення. Будь-яка помилка/невідомість = не чистимо.
 # Налаштування: ~/.config/petbox-autoclean.conf (рядки KEY=значення), читається щоцикл, перезапуск не потрібен.
 #   ENABLED=1            0 — нічого не чистити (служба працює вхолосту)
-#   QUIET_MIN=15         хвилин тиші після останньої події/руху
+#   QUIET_MIN=5          хвилин тиші після останньої події/руху
 #   BAN=02:00-10:00      заборона запуску за часом Лісабона; порожньо (BAN=) — нічні чистки дозволені
 #   MIN_GAP_MIN=60       мінімум хвилин між очищеннями
 #   MAX_PER_DAY=6        ліміт очищень за добу
@@ -26,7 +26,7 @@ LOOP_SEC = 60
 CLEAN_MARGIN_MIN = 15      # цикл не має заходити у заборонене вікно
 DONE_LIMIT = 900           # с очікування кінця циклу
 TZ = ZoneInfo("Europe/Lisbon")
-DEFAULTS = {"ENABLED": "1", "QUIET_MIN": "15", "BAN": "02:00-10:00", "MIN_GAP_MIN": "60", "MAX_PER_DAY": "6"}
+DEFAULTS = {"ENABLED": "1", "QUIET_MIN": "5", "BAN": "02:00-10:00", "MIN_GAP_MIN": "60", "MAX_PER_DAY": "6"}
 
 _loader = importlib.machinery.SourceFileLoader("psc", f"{HOME}/bin/petbox-safe-clean")
 psc = importlib.util.module_from_spec(importlib.util.spec_from_loader("psc", _loader))
