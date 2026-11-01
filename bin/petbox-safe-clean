@@ -478,7 +478,10 @@ def dry_run():
     lines, verdict = [], []
     st = petbox_status()
     ws, weight = st["workstatus"]["value"], st["catWeight"]["value"]
-    lines.append(f"лоток: workstatus={ws}, вага {weight / 1000:.2f} кг")
+    # Вага з хмари буває неправдива: збитий нуль ваг дає рівно 20.00 кг (01.11.2026 так і є; лікується
+    # підняттям кришки лотка, не кодом). На рішення вона не впливає ніде — лише друкується тут.
+    w = f"{weight / 1000:.2f} кг" + (" ⚠️ збитий нуль ваг — підніми кришку" if weight >= 15000 else "")
+    lines.append(f"лоток: workstatus={ws}, вага {w}")
     if ws != 0:
         verdict.append(f"workstatus={ws}")
     since = time.strftime("%Y-%m-%dT%H:%M:%S", time.localtime(time.time() - BUSY_MINUTES * 60))
