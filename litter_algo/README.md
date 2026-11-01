@@ -1,6 +1,6 @@
 # litter_algo
 
-Вердикт «вікно барабана порожнє / зайняте» і клас кадру (clear / near / inside / blocking / unknown) незалежно від положення камери. Експериментальний код, **у живу службу (`main.py`, `drum_check.py`) не підключено**; лише тіньовий режим (нижче).
+Вердикт «вікно барабана порожнє / зайняте» і клас кадру (clear / near / inside / blocking / unknown) незалежно від положення камери. Підключено в `bin/petbox-safe-clean` (основна перевірка кадру) і, з гілки `worktree-detector-litter-algo`, у детектор: `classify.py` (`drum_inside_confirmed`) через `drum_algo.py`, перемикач `drum_algo` у `config.yaml`; при збої алгоритму діють старі NCC-ознаки. Тіньовий режим: нижче.
 
 - `locate.py`: пошук лотка й вікна барабана; `classify.py`: вердикт і `decide()`; `empty_exemplars.npz`: 93 порожніх вікна (еталони).
 - Тест без cv2: `python3 -m unittest litter_algo.test_classify` (мітки Слави в `labels_2026-10-28.json`); `test_locate.py` потребує cv2 (venv на Ubuntu).
