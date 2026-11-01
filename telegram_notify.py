@@ -17,6 +17,51 @@ RETRY_BACKOFF_SECONDS = 3
 CAT_EMOJI = {"white": "⬜", "black": "⬛"}
 CAT_LABEL_UK = {"white": "Білий", "black": "Чорний", "unknown": "Колір невідомий"}
 
+# Другий рядок повідомлення: чи можна зараз чистити, за litter_algo (банк шаблонів положення камери).
+# Це довідка для Slava, а не дозвіл: чистку як і раніше вирішує petbox-safe-clean зі своїми перевірками.
+SHADE_UK = {"black": "чорний", "white": "білий"}
+SAFETY_TEXT = {
+    "clear": "🧹 чистити безпечно",
+    "inside": "⛔ чистити не можна: кіт у барабані",
+    "blocking": "⛔ чистити не можна: вхід перекрито",
+    "near": "⛔ чистити не можна: щось біля лотка",
+    "unknown": "❓ лотка не видно — чистити не можна",
+}
+_LOCATOR = None
+
+
+def safety_line(frame) -> str:
+    """Рядок «чи безпечно чистити» за кадром. Будь-який збій → порожній рядок: сповіщення має піти в будь-якому разі."""
+    if frame is None:
+        return ""
+    try:
+        global _LOCATOR
+        from litter_algo.classify import decide, verdict
+        from litter_algo.locate import Locator
+        if _LOCATOR is None:
+            _LOCATOR = Locator()
+        a = _LOCATOR.analyze(frame)
+        wv, _f, _g = verdict(a)
+        d = decide(wv, a["cells"], a["rim"], a["crop"])
+        line = SAFETY_TEXT.get(d, "")
+        if wv == "occupied":
+            # колір беремо щоразу, коли у вікні щось є: і коли кіт сидить усередині, і коли він затулив
+            # вікно собою ззовні. Коли вікно порожнє, міряти нічого — кіт (якщо він є) стоїть осторонь.
+            from litter_algo.classify import cat_shade
+            shade = SHADE_UK.get(cat_shade(a["crop"]))
+            if shade and d in ("inside", "blocking"):
+                line = ("⛔ чистити не можна: %s кіт у барабані" if d == "inside"
+                        else "⛔ чистити не можна: %s кіт перекриває вхід") % shade
+        return line
+    except Exception:
+        logger.exception("litter_algo: не вдалося оцінити, чи безпечно чистити")
+        return ""
+
+
+def _with_safety(text: str, frame) -> str:
+    line = safety_line(frame)
+    return f"{text}\n{line}" if line else text
+
 
 def _post_with_retry(*args, **kwargs) -> requests.Response:
     last_exc: Exception | None = None
@@ -85,8 +130,8 @@ def notify_visit(cat: str, is_day: bool, dwell_seconds: float, frame=None) -> No
     label = CAT_LABEL_UK.get(cat, cat)
     emoji = CAT_EMOJI.get(cat, "🐾")
     time_of_day = "вдень" if is_day else "вночі"
-    text = f"{emoji} {label} кіт сходив в туалет ({time_of_day}, {dwell_seconds:.0f}с)"
-    _notify(text, frame)
+    text = f"{emoji} {label} кіт сходив в туалет ({time_of_day}, у лотку {fmt_duration(dwell_seconds)})"
+    _notify(_with_safety(text, frame), frame)
 
 
 def notify_passby(cat: str, is_day: bool, frame=None) -> None:
@@ -94,13 +139,20 @@ def notify_passby(cat: str, is_day: bool, frame=None) -> None:
     emoji = CAT_EMOJI.get(cat, "🐾")
     time_of_day = "вдень" if is_day else "вночі"
     text = f"{emoji} {label} кіт пройшов повз ({time_of_day}, до лотка не заходив)"
-    _notify(text, frame)
+    _notify(_with_safety(text, frame), frame)
 
 
-def notify_exit(cat: str, frame=None) -> None:
+def fmt_duration(seconds: float) -> str:
+    """95 → «1 хв 35 с», 40 → «40 с»."""
+    s = int(round(max(seconds, 0)))
+    return f"{s // 60} хв {s % 60:02d} с" if s >= 60 else f"{s} с"
+
+
+def notify_exit(cat: str, frame=None, seconds: float | None = None) -> None:
     label = CAT_LABEL_UK.get(cat, cat)
     emoji = CAT_EMOJI.get(cat, "🐾")
-    _notify(f"{emoji} {label} кіт вийшов з лотка", frame)
+    took = f" (був у лотку {fmt_duration(seconds)})" if seconds is not None and seconds > 0 else ""
+    _notify(_with_safety(f"{emoji} {label} кіт вийшов з лотка{took}", frame), frame)
 
 
 def notify_inside(cat: str, frame=None) -> None:

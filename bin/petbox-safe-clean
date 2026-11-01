@@ -208,7 +208,11 @@ def align_gate(now=None):
         return f"сторож положення камери не відповідає ({now - upd:.0f} с без оновлення), невідомо"
     if state != "TRACKED":
         return f"лоток у кадрі не підтверджено (стан {state}: {st.get('reason', '?')})"
-    if not st.get("refs_match"):
+    # 01.11.2026, з дозволу Slava: refs_match потрібен лише старій NCC-перевірці барабана (еталони drum_check прив'язані
+    # до положення камери). При ALGO_PRIMARY кадр перевіряє litter_algo — він сам знаходить лоток у будь-якому положенні
+    # і дає unknown/near/blocking, якщо не впізнав лоток чи хтось поруч. Після переміщення камери ця вимога блокувала
+    # автоочищення назавжди. Стан TRACKED (лоток у кадрі) вимагається, як і раніше.
+    if not st.get("refs_match") and not ALGO_PRIMARY:
         return f"еталони режиму {st.get('mode')} зняті не для поточного положення камери (поза {st.get('pose')}, еталони {st.get('ref_poses')})"
     _enhanced = now < float(st.get("enhanced_until", 0))
     return None
@@ -492,24 +496,30 @@ def dry_run():
         log("камера не віддала кадр")
         notify("Пробне очищення: камера не віддала кадр")
         return
-    calib = load_calib()
-    aligned = [aligned_mode(f) for f in frames]
-    mode = aligned[-1][1]
+    # Яскравість вікна, режим камери (ir/irday) і YOLO потрібні лише старому шляху (ALGO_PRIMARY = False):
+    # вони спираються на зашиті частки кадру, а ті «з'їжджають», щойно пересунути камеру (01.11.2026 так і сталось:
+    # о 03:00 режим показувало «сірий денний», бо смужка скла дверей опинилась не там). litter_algo шукає лоток сам,
+    # тож при ALGO_PRIMARY ці числа нічого не вирішують і в повідомлення більше не йдуть.
     cat_seen = False
+    calib, mode, b = None, None, None
     if not ALGO_PRIMARY:
         from detect import detect
         cat_seen = any(d.label == "cat" for f in frames for d in detect(f, 0.25))
-    b = float(np.median([roi_brightness(a, m) for a, m in aligned]))
+        calib = load_calib()
+        aligned = [aligned_mode(f) for f in frames]
+        mode = aligned[-1][1]
+        b = float(np.median([roi_brightness(a, m) for a, m in aligned]))
     classes = algo_classes(frames) if ALGO_PRIMARY else []
     algo_why = algo_gate(frames, classes) if ALGO_PRIMARY else drum_ncc_gate(frames)
     if algo_why:
         verdict.append(algo_why)
     if ALGO_PRIMARY:
         lines.append("litter_algo: " + ", ".join(classes))
-    em = calib.get(mode, {}).get("empty", [])
-    lines.append(f"режим камери: { {'ir': 'нічний (ІЧ)', 'irday': 'сірий денний (вікно/фасад ×100)'}.get(mode, 'кольоровий') };")
-    lines.append((f"YOLO: {'кіт є' if cat_seen else 'кота не видно'}; " if not ALGO_PRIMARY else "") + f"яскравість вікна {b:.0f}"
-                 + (f" (порожній {min(em, key=lambda e: abs(b - e)):.0f})" if em else ""))
+    if not ALGO_PRIMARY:
+        em = calib.get(mode, {}).get("empty", [])
+        lines.append(f"режим камери: { {'ir': 'нічний (ІЧ)', 'irday': 'сірий денний (вікно/фасад ×100)'}.get(mode, 'кольоровий') };")
+        lines.append(f"YOLO: {'кіт є' if cat_seen else 'кота не видно'}; яскравість вікна {b:.0f}"
+                     + (f" (порожній {min(em, key=lambda e: abs(b - e)):.0f})" if em else ""))
     if cat_seen:
         verdict.append("YOLO бачить кота")
     if not ALGO_PRIMARY:

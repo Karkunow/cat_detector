@@ -59,3 +59,9 @@ def insert_event(
 def clear_events(conn: sqlite3.Connection) -> None:
     conn.execute("DELETE FROM events")
     conn.commit()
+
+
+def update_dwell(conn: sqlite3.Connection, event_id: int, dwell_seconds: float) -> None:
+    """Дописати справжню тривалість перебування в барабані, коли кіт вийшов (01.11.2026: visit_drum)."""
+    conn.execute("UPDATE events SET dwell_seconds = ? WHERE id = ?", (dwell_seconds, event_id))
+    conn.commit()

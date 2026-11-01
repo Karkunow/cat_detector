@@ -64,7 +64,7 @@ def _analyze_default(frame_path):
         raise ValueError("кадр не читається")
     a = _LOC.analyze(frame)
     wv, f, g = verdict(a)
-    return {"algo": decide(wv, a["cells"], a["rim"]), "window": wv, "f": f, "g": g, "score": a["score"],
+    return {"algo": decide(wv, a["cells"], a["rim"], a["crop"]), "window": wv, "f": f, "g": g, "score": a["score"],
             "scale": a["scale"], "cells": a["cells"], "rim": a["rim"]}
 
 

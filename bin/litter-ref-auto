@@ -1,0 +1,225 @@
+#!/home/slava/cat_detector/.venv/bin/python
+"""Сам додає в банк litter_algo шаблон поточного освітлення (денний), коли це безпечно.
+
+Навіщо. Шаблон корпусу лотка залежить не лише від положення камери, а й від світла: шаблон, знятий уночі в ІЧ,
+удень упізнає лоток удвічі гірше (перевірено 01.11.2026 на розмітці: 101 із 175 денних кадрів проти 172).
+Небезпечним це не робить — помилка завжди в бік відмови, — але лоток чиститься рідше, ніж міг би.
+
+Головне правило лишається: краще не почистити, ніж почистити з котом. Тому шаблон додається, лише якщо
+ВСІ перевірки пройдено, а потім кандидат ще й перевіряється на архівних кадрах із котом.
+
+Що перевіряємо перед тим, як узяти кадр за зразок:
+  1) надворі день (sun_is_up) — інакше виходимо, нічний шаблон у банку вже є;
+  2) лоток не працює (workstatus == 0), камера не бачила подій останні BUSY_MIN хв, рух не триває;
+  3) знімаємо N кадрів із проміжком GAP с; у КОЖНОМУ: вікно барабана порожнє з запасом (f <= F_SAFE, удвічі
+     суворіше за поріг алгоритму), YOLO не бачить кота, лоток знайдено на тому самому місці;
+  4) кадри майже однакові між собою — за час зйомки нічого не рухалось.
+Далі кандидат-шаблон перевіряється на архівних кадрах: на жодному кадрі з котом не має з'явитись «clear»,
+а порожніх має розпізнаватись не менше, ніж без нього. Лише тоді файл лягає в litter_algo/.
+
+Запуск: `litter-ref-auto` (cron щодня вдень). `--dry` — усе те саме, але файл не записується;
+`--ignore-sun` і LITTER_MIN_SCORE=… — щоб прогнати весь шлях для перевірки.
+Журнал: ~/litter_ref_auto.log. Чистку лотка скрипт не запускає НІКОЛИ.
+"""
+import json
+import os
+import subprocess
+import sys
+import time
+
+import cv2
+import numpy as np
+
+HOME = os.path.expanduser("~")
+sys.path.insert(0, f"{HOME}/cat_detector")
+os.chdir(f"{HOME}/cat_detector")          # yolov8n.pt підхоплюється відносним шляхом
+
+LOG = f"{HOME}/litter_ref_auto.log"
+ALGO_DIR = f"{HOME}/cat_detector/litter_algo"
+ARCHIVE = f"{HOME}/litter_archive_2026-10-28/frames"
+LABELS = f"{HOME}/litter_labels_2026-11-01/labels.tsv"
+N_FRAMES, GAP = 5, 10          # скільки кадрів і з яким проміжком (с)
+F_SAFE = 0.08                  # «вікно порожнє» із запасом (поріг алгоритму — 0.10, кіт у барабані дає >= 0.32;
+                               # 0.06 було надто жорстко: порожній лоток уночі 01.11 давав 0.065)
+MIN_SCORE_OK = float(os.environ.get("LITTER_MIN_SCORE", 0.80))   # якщо банк уже впізнає лоток ось так упевнено — новий шаблон не потрібен
+RECT_TOL = 4                   # на скільки пікселів може гуляти знайдене вікно між кадрами
+STILL_DIFF = 2.0               # середня різниця яскравості між кадрами: більше — щось рухалось
+BUSY_MIN = 15                  # скільки хвилин тиші від камери потрібно
+VALIDATE_CATS, VALIDATE_EMPTY = 80, 80   # скільки архівних кадрів брати на перевірку кандидата
+
+
+def log(msg):
+    line = time.strftime("%Y-%m-%d %H:%M:%S ") + msg
+    print(line)
+    with open(LOG, "a") as f:
+        f.write(line + "\n")
+
+
+def psc():
+    """Функції petbox-safe-clean (знімок із камери, стан лотка, запис SD) — без запуску чистки."""
+    import importlib.machinery
+    import importlib.util
+    loader = importlib.machinery.SourceFileLoader("psc", f"{HOME}/bin/petbox-safe-clean")
+    spec = importlib.util.spec_from_loader("psc", loader)
+    mod = importlib.util.module_from_spec(spec)
+    loader.exec_module(mod)
+    return mod
+
+
+def quiet_reason(m):
+    """Чому зараз не час знімати зразок (None — усе тихо)."""
+    try:
+        st = m.petbox_status()
+        ws = st["workstatus"]["value"]
+        if ws != 0:
+            return f"лоток працює (workstatus={ws})"
+    except Exception as e:
+        return f"стан лотка не прочитався ({type(e).__name__}: {e})"
+    try:
+        import sqlite3
+        since = time.strftime("%Y-%m-%dT%H:%M:%S", time.localtime(time.time() - BUSY_MIN * 60))
+        row = sqlite3.connect(f"file:{m.EVENTS_DB}?mode=ro", uri=True).execute(
+            "select timestamp from events order by id desc limit 1").fetchone()
+        if row and row[0] > since:
+            return f"камера бачила подію за останні {BUSY_MIN} хв"
+    except Exception as e:
+        return f"events.db недоступна ({e})"
+    try:
+        state = json.load(open(m.MOTION_STATE))
+        if state.get("motion"):
+            return "детектор бачить рух просто зараз"
+    except Exception:
+        pass        # немає файла стану — не привід відмовлятись, решта перевірок лишається
+    return None
+
+
+def frames_ok(frames, L, classify):
+    """(причина відмови або None, аналізи кадрів). Кадр годиться в зразок лише якщо лоток порожній напевно."""
+    from detect import detect
+    analyses = []
+    for i, fr in enumerate(frames):
+        a = L.analyze(fr)
+        wv, f, g = classify.verdict(a)
+        analyses.append(a)
+        if a["rect"] is None:
+            return f"кадр {i}: лоток не знайдено", analyses
+        if wv != "empty" or f is None or f > F_SAFE:
+            return f"кадр {i}: вікно барабана не схоже на напевно порожнє (f={f})", analyses
+        if any(d.label == "cat" for d in detect(fr, 0.25)):
+            return f"кадр {i}: YOLO бачить кота", analyses
+    r0 = analyses[0]["rect"]
+    if any(max(abs(x - y) for x, y in zip(a["rect"], r0)) > RECT_TOL for a in analyses):
+        return "лоток «гуляє» між кадрами — камеру зараз чіпають", analyses
+    g = [cv2.cvtColor(f, cv2.COLOR_BGR2GRAY).astype(np.float32) for f in frames]
+    if max(float(np.abs(g[i] - g[0]).mean()) for i in range(1, len(g))) > STILL_DIFF:
+        return "кадри різняться між собою — у кімнаті щось рухається", analyses
+    return None, analyses
+
+
+def sample(label_set, limit):
+    """Архівні кадри з розмітки: шляхи для заданих міток."""
+    out = []
+    for line in open(LABELS).read().splitlines()[1:]:
+        p = line.split("\t")
+        if len(p) > 2 and p[2] in label_set:
+            out.append(os.path.join(ARCHIVE, p[1]))
+    step = max(len(out) // limit, 1)
+    return out[::step][:limit]
+
+
+def validate(cand_path, classify, locate):
+    """Кандидат не має дозволяти чистку там, де її не дозволяв банк без нього."""
+    base = locate.Locator()
+    with_cand = locate.Locator(ref_path=locate.ref_paths() + [cand_path])
+    bad = 0
+    for p in sample({"I", "O", "U"}, VALIDATE_CATS):
+        fr = cv2.imread(p)
+        if fr is None:
+            continue
+        a = with_cand.analyze(fr)
+        wv, f, g = classify.verdict(a)
+        if classify.decide(wv, a["cells"], a["rim"], a["crop"]) == "clear":
+            bad += 1
+            log(f"  УВАГА: з кандидатом кадр із котом став clear: {p}")
+    empties = sample({"E"}, VALIDATE_EMPTY)
+    def count_clear(L):
+        n = 0
+        for p in empties:
+            fr = cv2.imread(p)
+            if fr is None:
+                continue
+            a = L.analyze(fr)
+            wv, f, g = classify.verdict(a)
+            n += classify.decide(wv, a["cells"], a["rim"], a["crop"]) == "clear"
+        return n
+    before, after = count_clear(base), count_clear(with_cand)
+    log(f"  перевірка на архіві: кадрів із котом дозволено {bad} (має бути 0); порожніх розпізнано {before} → {after}")
+    return bad == 0 and after >= before
+
+
+def main():
+    dry = "--dry" in sys.argv
+    from classify import sun_is_up
+    if not sun_is_up() and "--ignore-sun" not in sys.argv:   # --ignore-sun лише для перевірки скрипта
+        log("надворі ніч — зразок денного освітлення зараз не зняти, виходжу")
+        return 0
+    from litter_algo import classify as lclassify
+    from litter_algo import locate as llocate
+    m = psc()
+    why = quiet_reason(m)
+    if why:
+        log(f"не час: {why}")
+        return 0
+    frames = m.grab_frames(n=N_FRAMES, gap=GAP)
+    if len(frames) < N_FRAMES:
+        log(f"камера віддала лише {len(frames)} кадрів із {N_FRAMES}, виходжу")
+        return 0
+    L = llocate.Locator()
+    scores = []
+    for fr in frames:
+        a = L.analyze(fr)
+        wv, f, g = lclassify.verdict(a)
+        scores.append((a["score"], lclassify.decide(wv, a["cells"], a["rim"], a["crop"]), a["ref"]))
+    if all(s >= MIN_SCORE_OK and d == "clear" for s, d, _ in scores):
+        log(f"банк уже впізнає лоток за цього світла (score {min(s for s, _, _ in scores):.2f}, усі clear) — нічого не роблю")
+        return 0
+    log("банк упізнає лоток гірше, ніж міг би: " + ", ".join(f"{s:.2f}/{d}" for s, d, _ in scores))
+    why, analyses = frames_ok(frames, L, lclassify)
+    if why:
+        log(f"зразок не беру: {why}")
+        return 0
+    from litter_algo.add_ref import build
+    ref, scale = build(frames[-1], analyses[-1]["rect"])
+    os.makedirs(f"{HOME}/litter_ref_day", exist_ok=True)
+    stamp = time.strftime("%Y%m%d-%H%M")
+    cand = f"{HOME}/litter_ref_day/cand-{stamp}.jpg"
+    cv2.imwrite(cand, ref, [cv2.IMWRITE_JPEG_QUALITY, 95])
+    cv2.imwrite(f"{HOME}/litter_ref_day/frame-{stamp}.jpg", frames[-1])
+    log(f"кандидат зібрано ({cand}, масштаб {scale:.2f}), перевіряю на архівних кадрах")
+    if not validate(cand, lclassify, llocate):
+        log("кандидат НЕ пройшов перевірку — у банк не кладу")
+        return 1
+    dest = os.path.join(ALGO_DIR, f"ref_box_auto{stamp[:8]}.jpg")
+    if dry:
+        log(f"--dry: усе пройдено, але файл не записую ({dest})")
+        return 0
+    if os.path.exists(dest):
+        log(f"шаблон на сьогодні вже є ({dest}) — не чіпаю")
+        return 0
+    tmp = dest + ".part"
+    cv2.imwrite(tmp, ref, [cv2.IMWRITE_JPEG_QUALITY, 95])
+    os.rename(tmp, dest)       # кладемо одним рухом: Locator не має побачити недописаний файл
+    log(f"ДОДАНО шаблон {dest}; служби підхоплять його самі протягом хвилини")
+    try:
+        m.telegram_photo(frames[-1], f"🔧 Додав шаблон лотка для денного світла — тепер удень чистка блокуватиметься рідше.\nФайл: {os.path.basename(dest)}")
+    except Exception as e:
+        log(f"повідомлення в Telegram не пішло ({e})")
+    return 0
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main())
+    except Exception as e:
+        log(f"збій: {type(e).__name__}: {e}")
+        sys.exit(1)

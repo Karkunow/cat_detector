@@ -1,10 +1,13 @@
+import json
 import logging
+import os
 import statistics
 
 import cv2
 import numpy as np
 
 import drum_algo
+import visit_drum
 from detect import Detection, detect
 from align_guard import blend_allowed
 from drum_check import align_with_shift, NCC_CAT, REF_UPDATE_NCC, RIM_CAT, SIDE_CAT, blend_ref, load_refs, observe, ratio_color, save_ref
@@ -50,18 +53,50 @@ def wall_and_front(frame, shift=(0.0, 0.0)) -> tuple[float, float]:
     return wall, front
 
 
-BRIGHT_PIXEL, BRIGHT_WHITE_FRAC = 150, 0.40  # білий кіт близько до камери пересвічений: ≥40% пікселів кота яскравіші за 150 (чорні в ІЧ: ≤28%)
+BRIGHT_PIXEL, BRIGHT_WHITE_FRAC = 150, 0.35  # білий кіт близько до камери пересвічений: ≥35% пікселів кота яскравіші за 150 (чорні в ІЧ: ≤28%); було 0.40, 29.10 00:34 білий мав 39% і став «чорним»
 
 
-def bright_override(color: str, frame, bbox) -> str:
+BRIGHT_MIN_RATIO = 0.40  # кіт темніший за 0.40 фасаду — чорний напевно (чорний 0.23–0.38, білий ≥0.54): яскраві пікселі в рамці — це білий лоток за ним; 29.10 01:07 чорний (0.23) став «білим»
+
+
+def bright_override(color: str, frame, bbox, ratio: float | None = None) -> str:
     """Чорний за відношенням до фасаду, але кадр кота майже весь яскравий — це білий кіт (медіана по кадрах події тягнулась униз фоном)."""
     if color == "white" or frame is None or bbox is None:
+        return color
+    if ratio is not None and ratio < BRIGHT_MIN_RATIO:
         return color
     v = cv2.cvtColor(crop_bbox(frame, bbox), cv2.COLOR_BGR2GRAY).ravel()
     if v.size and float((v > BRIGHT_PIXEL).mean()) >= BRIGHT_WHITE_FRAC:
         logging.getLogger(__name__).info(f"кіт на кадрі яскравий ({100 * float((v > BRIGHT_PIXEL).mean()):.0f}% пікселів >{BRIGHT_PIXEL}): {color} -> white")
         return "white"
     return color
+
+
+FRONT_DARK = 150   # звичний фасад ~175; 121–141 буває, коли чорний кіт сам затемнює область фасаду й завищує відношення (30.10 06:54 «білий» — п'ять кадрів; не підтверджено очима)
+FRONT_HIST_N = 40
+FRONT_HIST_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data", "front_hist.json")
+
+
+def front_reference(front: float, path: str = FRONT_HIST_PATH) -> tuple[float, bool]:
+    """(фасад для відношення, чи він лишився недостовірним). Нормальний фасад (>= FRONT_DARK) дописуємо в ковзну історію;
+    темний замінюємо медіаною історії; немає історії — лишаємо як є й просимо не видавати «білий»."""
+    try:
+        with open(path) as fh:
+            hist = [float(x) for x in json.load(fh)]
+    except (OSError, ValueError, TypeError):
+        hist = []
+    if front >= FRONT_DARK:
+        try:
+            tmp = path + ".tmp"
+            with open(tmp, "w") as fh:
+                json.dump((hist + [round(front, 1)])[-FRONT_HIST_N:], fh)
+            os.replace(tmp, path)
+        except OSError:
+            pass
+        return front, False
+    if len(hist) >= 5:
+        return statistics.median(hist), False
+    return front, True
 
 
 def classify_ir_day(brightness: float, front: float) -> str:
@@ -264,6 +299,8 @@ def classify_frames(frame_iter, config: dict, current_hour: int | None = None) -
 
     episodes: list[dict] = []
     current: dict | None = None
+    # Чи кіт справді в барабані, а не перед лотком (visit_drum.py, 01.11.2026). false у config — як раніше.
+    drum_track = visit_drum.DrumTrack() if config.get("visit_drum_check", True) else None
 
     def close_current() -> None:
         nonlocal current
@@ -286,6 +323,12 @@ def classify_frames(frame_iter, config: dict, current_hour: int | None = None) -
             fronts.append(fr)
         dets = detect(frame, config["yolo_confidence"])
         cat_det = best_detection(dets, "cat", frame.shape)
+        if drum_track is not None:
+            try:
+                drum_track.add(t, frame, [d.bbox for d in dets if d.label == "cat"])
+            except Exception:
+                logging.getLogger(__name__).exception("visit_drum: збій, візити рахуються по-старому")
+                drum_track = None
 
         inside = False
         if cat_det:
@@ -353,6 +396,12 @@ def classify_frames(frame_iter, config: dict, current_hour: int | None = None) -
     # у будь-якому ІЧ-кадрі (день чи ніч) міряємо відносно фасаду: абсолютна яскравість кота плаває 140–160 і ловить «unknown»
     ir_day = bool(walls) and not is_day_time_color(spreads)
     front = statistics.median(fronts) if fronts else 0.0
+    front_doubtful = False
+    if ir_day and front > 0:
+        raw_front = front
+        front, front_doubtful = front_reference(raw_front)
+        if front != raw_front:
+            logging.getLogger(__name__).info(f"фасад {raw_front:.0f} темний (< {FRONT_DARK}): беру медіану історії {front:.0f}")
     if ir_day:
         logging.getLogger(__name__).info(f"сірий денний ІЧ-режим: wall={statistics.median(walls):.0f}, фасад={front:.0f}")
 
@@ -361,6 +410,9 @@ def classify_frames(frame_iter, config: dict, current_hour: int | None = None) -
         logging.getLogger(__name__).info(
             f"яскравість кота {brightness:.0f} (фасад {front:.0f}, відношення {brightness / max(front, 1.0):.2f}, ir_day={ir_day}) -> {color}"
         )
+        if front_doubtful and color == "white":
+            logging.getLogger(__name__).info(f"фасад {front:.0f} темний і історії нема: white -> unknown")
+            return "unknown"
         return color
 
     if total_frames == 0:
@@ -388,21 +440,42 @@ def classify_frames(frame_iter, config: dict, current_hour: int | None = None) -
         for ep in episodes
         if ep["dwell"] >= min_dwell and ep["visible_density"] <= max_visible_density
     ]
+    drum = drum_track.summary(last_t) if drum_track is not None else None
+    if drum is not None:
+        logging.getLogger(__name__).info(
+            "visit_drum: %s | у барабані %d кадрів, %.0f с, досі всередині=%s, лоток видно=%s",
+            drum["trace"], drum["n_drum"], drum["drum_seconds"], drum["inside_at_end"], drum["seen_box"])
+        if confirmed and not drum["visit"]:
+            # YOLO довго бачив кота в зоні входу, але в барабан він не заходив (сидів перед лотком / лотка не видно)
+            logging.getLogger(__name__).info("visit_drum: кіт був біля лотка, але не в барабані — це не візит")
+            confirmed = []
+        elif drum["visit"] and not drum["inside_at_end"] and not confirmed:
+            # кіт зайшов і вийшов, а YOLO-епізод не набрав min_dwell (кіт у куполі майже невидимий) — це візит
+            ep_all = {"brightness": all_brightness_samples, "best_conf": max_conf, "best_frame": best_cat_frame,
+                      "best_bbox": best_cat_bbox, "dwell": drum["drum_seconds"]}
+            confirmed = [ep_all] if all_brightness_samples else []
+        if confirmed and drum["visit"] and drum["inside_at_end"]:
+            confirmed = []   # кіт досі в барабані: нижче гілка «inside_now», тривалість дорахує вихід
     if confirmed:
         results = []
         for ep in confirmed:
             brightness = statistics.median(ep["brightness"])
-            label = bright_override(label_color(brightness), ep["best_frame"], ep.get("best_bbox"))
+            label = bright_override(label_color(brightness), ep["best_frame"], ep.get("best_bbox"), brightness / max(front, 1.0))
             results.append(
                 {
                     "cat": label,
                     "is_day": is_day,
                     "confidence": ep["best_conf"],
-                    "dwell_seconds": ep["dwell"],
+                    # тривалість — час кота В БАРАБАНІ (visit_drum), а не час, коли його видно біля входу
+                    "dwell_seconds": drum["drum_seconds"] if drum and drum["visit"] else ep["dwell"],
                     "confirmed_visit": True,
                     "best_frame": ep["best_frame"],
+                    "drum_start_t": drum["drum_start_t"] if drum else None,
+                    "drum_end_t": drum["drum_end_t"] if drum else None,
                 }
             )
+            if drum and drum["visit"]:
+                break    # один візит у барабан на подію: час уже сумарний
         return results
 
     # «Кіт всередині» — без YOLO: контури вікна барабана наприкінці події не схожі на порожній референс режиму,
@@ -440,9 +513,28 @@ def classify_frames(frame_iter, config: dict, current_hour: int | None = None) -
                     "dwell_seconds": last_t - low_run[-1]["t"],
                     "confirmed_visit": False,
                     "inside_now": True,
+                    "drum_start_t": drum["drum_start_t"] if drum and drum["n_drum"] else low_run[-1]["t"],
                     "best_frame": ep["best_frame"] if ep and ep["best_frame"] is not None else last_frame,
                 }
             ]
+
+    if drum and drum["visit"] and drum["inside_at_end"]:
+        # кіт зайшов у барабан і на кінці події досі там, а старі ознаки «inside» цього не підтвердили
+        samples = episodes[-1]["brightness"] if episodes else all_brightness_samples
+        color = label_color(statistics.median(samples)) if samples else "unknown"
+        return [
+            {
+                "cat": f"{color}_inside",
+                "color": color,
+                "is_day": is_day,
+                "confidence": max_conf,
+                "dwell_seconds": drum["drum_seconds"],
+                "confirmed_visit": False,
+                "inside_now": True,
+                "drum_start_t": drum["drum_start_t"],
+                "best_frame": best_cat_frame if best_cat_frame is not None else last_frame,
+            }
+        ]
 
     if cat_frames == 0:
         return [
@@ -460,7 +552,7 @@ def classify_frames(frame_iter, config: dict, current_hour: int | None = None) -
     # "passed by" notification can be sent.
     best_dwell = max((ep["dwell"] for ep in episodes), default=0.0)
     brightness = statistics.median(all_brightness_samples)
-    color = bright_override(label_color(brightness), best_cat_frame, best_cat_bbox)
+    color = bright_override(label_color(brightness), best_cat_frame, best_cat_bbox, brightness / max(front, 1.0))
     label = f"{color}_passby" if color != "unknown" else "pass_through"
     return [
         {
@@ -470,5 +562,7 @@ def classify_frames(frame_iter, config: dict, current_hour: int | None = None) -
             "dwell_seconds": best_dwell,
             "confirmed_visit": False,
             "best_frame": best_cat_frame,
+            # для виходу з лотка: коли кота востаннє бачили в барабані (None — у цій події в барабані не був)
+            "drum_end_t": drum["drum_end_t"] if drum else None,
         }
     ]
