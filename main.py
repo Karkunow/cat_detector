@@ -97,6 +97,13 @@ async def main() -> None:
     # Перебування може тягтися через кілька подій: кіт сидить нерухомо — камера мовчить — потім виходить.
     drum_stay: dict | None = None
     DRUM_STAY_MAX = config.get("drum_stay_max_minutes", 30) * 60   # довше — вважаємо, що вихід ми пропустили
+    # Скільки перевірок recheck_inside поспіль сказали «кіт усередині»: (колір, лічильник, час останньої).
+    # Одна перевірка стан «кіт у барабані» більше не відкриває: 01.11.2026 вдень кожна перевірка на ПОРОЖНЬОМУ
+    # лотку давала «inside» (вікно барабана не збігалося з еталонами), фантомний стан висів годинами й з'їдав
+    # справжні візити — прихід кота читався як вихід із фантома. Порожній барабан лічильник скидає.
+    recheck_hits: tuple[str, int, float] | None = None
+    RECHECK_HITS_MIN = config.get("recheck_hits_min", 2)        # скільки перевірок поспіль потрібно для drum_stay
+    RECHECK_HITS_WINDOW = config.get("recheck_hits_window_minutes", 10) * 60   # старіші за це не враховуються
     motion_active = False
     last_motion_ts = 0.0
 
@@ -207,7 +214,7 @@ async def main() -> None:
     async def recheck_inside(color: str, event_ts: float) -> None:
         """Кіт зайшов у лоток і сидить без руху: ONVIF мовчить, події нема. Через inside_recheck_seconds після входу дивимось
         свіжі кадри барабана; не порожній — шлемо «сидить усередині» (ті самі dedupe й last_visit, що в classify)."""
-        nonlocal inside_since, last_visit, drum_stay
+        nonlocal inside_since, last_visit, drum_stay, recheck_hits
         try:
             await asyncio.sleep(config.get("inside_recheck_seconds", 20))
             if capturing:
@@ -219,6 +226,14 @@ async def main() -> None:
             res = await asyncio.to_thread(drum_inside_check, frames, config) if frames else None
             if res is None:
                 logger.info("Inside recheck: барабан порожній або кадрів нема")
+                # Барабан порожній — кота там нема: наступне «усередині» це вже НОВИЙ візит, а не продовження
+                # старого, тож і лічильник, і глушилка повторів скидаються (інакше справжній вхід у межах
+                # inside_dedup_minutes після хибного лишався без сповіщення).
+                recheck_hits = None
+                inside_since = None
+                if drum_stay and drum_stay.get("src") == "recheck":
+                    logger.info("Inside recheck: барабан порожній — скидаю неперевірений стан «кіт у барабані»")
+                    drum_stay = None
                 return
             if capturing:
                 return
@@ -236,8 +251,15 @@ async def main() -> None:
                 dwell_seconds=0.0,
                 source_clip="live",
             )
-            if drum_stay is None:
-                drum_stay = {"color": color, "start": event_ts, "row": row_id}   # зайшов не пізніше за подію, що передувала recheck
+            hits = recheck_hits[1] + 1 if (recheck_hits and recheck_hits[0] == color
+                                           and ts - recheck_hits[2] <= RECHECK_HITS_WINDOW) else 1
+            recheck_hits = (color, hits, ts)
+            if drum_stay is None and hits >= RECHECK_HITS_MIN:
+                # зайшов не пізніше за подію, що передувала recheck; src=recheck — стан відкрито без visit_drum,
+                # тож перша ж порожня перевірка його скасує
+                drum_stay = {"color": color, "start": event_ts, "row": row_id, "src": "recheck"}
+            elif drum_stay is None:
+                logger.info("Inside recheck: %d-та перевірка поспіль, стан «кіт у барабані» ще не відкриваю", hits)
             if inside_since and inside_since[1] == color and ts - inside_since[0] < config.get("inside_dedup_minutes", 10) * 60:
                 return
             inside_since = (ts, color)
@@ -260,7 +282,7 @@ async def main() -> None:
             logger.exception("Failed to save post-event context frames")
 
     async def finalize_event() -> None:
-        nonlocal capturing, finalize_task, inside_since, last_visit, processing, drum_stay
+        nonlocal capturing, finalize_task, inside_since, last_visit, processing, drum_stay, recheck_hits
         try:
             await asyncio.sleep(coalesce_gap)
         except asyncio.CancelledError:
@@ -320,7 +342,8 @@ async def main() -> None:
                     last_visit = (ts, result["color"])
                     if drum_stay is None or drum_stay["color"] not in (result["color"], "unknown"):
                         start = ev_start_wall + (result.get("drum_start_t") or 0.0)
-                        drum_stay = {"color": result["color"], "start": start, "row": row_id}
+                        # src=event — стан підтверджено розбором самої події (а не однією перевіркою кадру)
+                        drum_stay = {"color": result["color"], "start": start, "row": row_id, "src": "event"}
                     if not (
                         inside_since
                         and inside_since[1] == result["color"]
@@ -339,6 +362,7 @@ async def main() -> None:
                         dwell = max(dwell, ev_start_wall + result["drum_end_t"] - drum_stay["start"])
                         storage.update_dwell(conn, row_id, dwell)
                     drum_stay = None
+                    recheck_hits = None
                     telegram_notify.notify_visit(result["cat"], result["is_day"], dwell, frame=frame)
                 elif result["cat"] in ("white_passby", "black_passby"):
                     color = result["cat"].removesuffix("_passby")
@@ -352,7 +376,11 @@ async def main() -> None:
                                 storage.update_dwell(conn, drum_stay["row"], took)
                             logger.info("visit_drum: %s кіт вийшов, був у барабані %.0f с", color, took)
                         drum_stay = None
+                        recheck_hits = None
                         telegram_notify.notify_exit(color, frame=frame, seconds=took)
+                        # Кіт міг не вийти, а ЗАЙТИ: 01.11.2026 прихід о 12:54 зарахувався як вихід із фантомного
+                        # візиту, і справжній вхід ніхто не перевірив. Після «виходу» теж дивимось барабан.
+                        asyncio.create_task(recheck_inside(color, ts))
                     else:
                         telegram_notify.notify_passby(color, result["is_day"], frame=frame)
                         asyncio.create_task(recheck_inside(color, ts))

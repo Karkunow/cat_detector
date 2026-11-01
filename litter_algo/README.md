@@ -3,6 +3,11 @@
 Вердикт «вікно барабана порожнє / зайняте» і клас кадру (clear / near / inside / blocking / unknown) незалежно від положення камери. Підключено в `bin/petbox-safe-clean` (основна перевірка кадру) і, з гілки `worktree-detector-litter-algo`, у детектор: `classify.py` (`drum_inside_confirmed`) через `drum_algo.py`, перемикач `drum_algo` у `config.yaml`; при збої алгоритму діють старі NCC-ознаки. Тіньовий режим: нижче.
 
 - `locate.py`: пошук лотка й вікна барабана; `classify.py`: вердикт і `decide()`; `empty_exemplars.npz`: 93 порожніх вікна (еталони).
+- `add_empty.py`: додати в `empty_exemplars.npz` вміст ПОРОЖНЬОГО вікна для нового світла/положення камери.
+  Без денних еталонів порожнього вікна f на порожньому лотку перевищує F_MAX і кожен денний кадр стає `inside`
+  (01.11.2026 після переїзду камери: ніч 0.067, день 0.17–0.21 при порозі 0.10). `add_ref.py` додає лише шаблон
+  ПОШУКУ лотка, вмісту вікна — ні. Без `--yes` лише смужка кропів для перевірки очима; із `--yes` кандидати
+  спершу проганяються на розмітці Слави (жоден кадр із котом не має стати `clear`), інакше нічого не пишеться.
 - Тест без cv2: `python3 -m unittest litter_algo.test_classify` (мітки Слави в `labels_2026-10-28.json`); `test_locate.py` потребує cv2 (venv на Ubuntu).
 - Скрипти `build_crops.py`, `make_sheets.py`, `render_review.py` збирають кропи й папку перевірки очима.
 - Історія раундів і пороги: `docs/litter.md` у репозиторії ai-agents-dispatcher (гілка `worktree-litter-bounds-r2`, PR #1).
