@@ -119,6 +119,24 @@ def validate(ex_old, ex_new, loc, log=print):
     return bad == 0 and after >= before
 
 
+def append(crops, names, log=print, do_validate=True):
+    """Програмний шлях (litter-ref-auto): додати готові нормовані кропи в бібліотеку.
+    Повертає True, якщо записано. Перевірку на розмітці вимикати лише там, де її вже зроблено."""
+    loc = Locator()
+    ex_old, src_old = _library()
+    ex_new = np.concatenate([ex_old, np.array(list(crops), np.float32)])
+    if do_validate and not validate(ex_old, ex_new, loc, log=log):
+        log("  кандидати в еталони НЕ пройшли перевірку — бібліотеку не чіпаю")
+        return False
+    bak = LIB + ".bak-" + datetime.datetime.now().strftime("%Y%m%d-%H%M")
+    shutil.copy(LIB, bak)
+    tmp = LIB + ".part.npz"
+    np.savez_compressed(tmp, ex=ex_new, src=np.array(src_old + list(names)))
+    os.replace(tmp, LIB)   # одним рухом: служба не має прочитати недописаний файл
+    log("  додано еталонів порожнього вікна: %d → %d (бекап %s)" % (len(ex_old), len(ex_new), os.path.basename(bak)))
+    return True
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser()
     ap.add_argument("frames", nargs="+", help="кадри ЗАВІДОМО порожнього лотка")
@@ -150,17 +168,11 @@ def main(argv=None):
     cv2.imwrite(a.check, np.hstack(tiles))
     print("смужка для перевірки очима:", a.check)
 
-    ex_new = np.concatenate([ex_old, np.array(new, np.float32)])
     if not a.yes:
         print("файл НЕ записано (додай --yes, коли на смужці всі вікна порожні):", LIB)
         return 0
-    if not a.skip_validate:
-        if not validate(ex_old, ex_new, loc):
-            raise SystemExit("перевірка не пройдена — нічого не записано")
-    bak = LIB + ".bak-" + datetime.datetime.now().strftime("%Y%m%d-%H%M")
-    shutil.copy(LIB, bak)
-    np.savez_compressed(LIB, ex=ex_new, src=np.array(src_old + names))
-    print("записано: %s (%d → %d еталонів), бекап %s" % (LIB, len(ex_old), len(ex_new), bak))
+    if not append(new, names, do_validate=not a.skip_validate):
+        raise SystemExit("перевірка не пройдена — нічого не записано")
     return 0
 
 
