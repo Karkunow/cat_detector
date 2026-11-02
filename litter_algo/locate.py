@@ -204,6 +204,14 @@ class Locator:
         self._hint_ang = last[4] if last else 0
         if k != 1.0 and best[2] is not None:
             best = (best[0], best[1], tuple(int(round(v * k)) for v in best[2]))
+        # Телеметрія «чи не зсунули камеру»: score з КОЖНОГО розпізнавання. Падіння 0.9 → 0.5 означає,
+        # що шаблон більше не підходить; за цим підсумком `litter-ref-auto --if-shifted` сам знімає новий.
+        # Збій телеметрії не має права зламати розпізнавання, тому все в try.
+        try:
+            from . import locate_health
+            locate_health.record(best[0], last[3].name if last else None)
+        except Exception:
+            pass
         return best
 
     def analyze(self, frame):
