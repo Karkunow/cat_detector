@@ -352,24 +352,31 @@ async def main() -> None:
                         inside_since = (ts, result["color"])
                         telegram_notify.notify_inside(result["color"], frame=frame)
                     continue
-                if result["cat"] in ("white", "black", "white_passby", "black_passby"):
+                if result["cat"] in ("white", "black", "unknown_visit", "white_passby", "black_passby", "pass_through"):
                     inside_since = None
-                if result["cat"] in ("white", "black"):
-                    last_visit = (ts, result["cat"])
+                # «unknown_visit» — підтверджений візит, у якого не вдалось надійно визначити колір (03.11.2026):
+                # раніше такий результат мав cat="unknown" і мовчки випадав з усіх гілок
+                if result["cat"] in ("white", "black", "unknown_visit"):
+                    visit_color = result.get("color") or result["cat"]
+                    last_visit = (ts, visit_color)
                     dwell = result["dwell_seconds"]
-                    if drum_stay and drum_stay["color"] in (result["cat"], "unknown") and result.get("drum_end_t") is not None:
+                    if drum_stay and (visit_color == "unknown" or drum_stay["color"] in (visit_color, "unknown")) and result.get("drum_end_t") is not None:
                         # кіт сидів у барабані ще з попередньої події: рахуємо від входу до останнього кадру в барабані
                         dwell = max(dwell, ev_start_wall + result["drum_end_t"] - drum_stay["start"])
                         storage.update_dwell(conn, row_id, dwell)
                     drum_stay = None
                     recheck_hits = None
-                    telegram_notify.notify_visit(result["cat"], result["is_day"], dwell, frame=frame)
-                elif result["cat"] in ("white_passby", "black_passby"):
-                    color = result["cat"].removesuffix("_passby")
-                    if last_visit and last_visit[1] == color and ts >= last_visit[0]:
+                    telegram_notify.notify_visit(visit_color, result["is_day"], dwell, frame=frame)
+                elif result["cat"] in ("white_passby", "black_passby", "pass_through"):
+                    color = result.get("color") or result["cat"].removesuffix("_passby")
+                    # колір невідомий з одного боку зараховуємо за вихід лише тоді, коли ми й так знаємо,
+                    # що кіт сидить у барабані (drum_stay) — інакше чужий прохід ставав би «кіт вийшов»
+                    matches = last_visit and ts >= last_visit[0] and (
+                        last_visit[1] == color or ("unknown" in (last_visit[1], color) and drum_stay is not None))
+                    if matches:
                         last_visit = None
                         took = None
-                        if drum_stay and drum_stay["color"] in (color, "unknown"):
+                        if drum_stay and (color == "unknown" or drum_stay["color"] in (color, "unknown")):
                             left = ev_start_wall + (result.get("drum_end_t") or 0.0)   # останній кадр у барабані, або початок події виходу
                             took = max(left - drum_stay["start"], 0.0)
                             if drum_stay.get("row"):
@@ -384,8 +391,6 @@ async def main() -> None:
                     else:
                         telegram_notify.notify_passby(color, result["is_day"], frame=frame)
                         asyncio.create_task(recheck_inside(color, ts))
-                elif result["cat"] == "pass_through":
-                    asyncio.create_task(recheck_inside("unknown", ts))
         except asyncio.CancelledError:
             raise
         except Exception:

@@ -28,6 +28,12 @@ SAFETY_TEXT = {
     "unknown": "❓ лотка не видно — чистити не можна",
 }
 _LOCATOR = None
+def _subject(cat: str) -> tuple[str, str]:
+    """(емодзі, підмет). Колір невідомий — пишемо просто «Кіт», без вигаданого кольору (03.11.2026)."""
+    emoji = CAT_EMOJI.get(cat, "🐾")
+    label = CAT_LABEL_UK.get(cat)
+    return emoji, f"{label} кіт" if cat in ("white", "black") else "Кіт"
+
 
 
 def safety_line(frame) -> str:
@@ -127,18 +133,16 @@ def _notify_one(text: str, frame, chat_id: str) -> None:
 
 
 def notify_visit(cat: str, is_day: bool, dwell_seconds: float, frame=None) -> None:
-    label = CAT_LABEL_UK.get(cat, cat)
-    emoji = CAT_EMOJI.get(cat, "🐾")
+    emoji, who = _subject(cat)
     time_of_day = "вдень" if is_day else "вночі"
-    text = f"{emoji} {label} кіт сходив в туалет ({time_of_day}, у лотку {fmt_duration(dwell_seconds)})"
+    text = f"{emoji} {who} сходив в туалет ({time_of_day}, у лотку {fmt_duration(dwell_seconds)})"
     _notify(_with_safety(text, frame), frame)
 
 
 def notify_passby(cat: str, is_day: bool, frame=None) -> None:
-    label = CAT_LABEL_UK.get(cat, cat)
-    emoji = CAT_EMOJI.get(cat, "🐾")
+    emoji, who = _subject(cat)
     time_of_day = "вдень" if is_day else "вночі"
-    text = f"{emoji} {label} кіт пройшов повз ({time_of_day}, до лотка не заходив)"
+    text = f"{emoji} {who} пройшов повз ({time_of_day}, до лотка не заходив)"
     _notify(_with_safety(text, frame), frame)
 
 
@@ -149,13 +153,12 @@ def fmt_duration(seconds: float) -> str:
 
 
 def notify_exit(cat: str, frame=None, seconds: float | None = None) -> None:
-    label = CAT_LABEL_UK.get(cat, cat)
-    emoji = CAT_EMOJI.get(cat, "🐾")
+    emoji, who = _subject(cat)
     took = f" (був у лотку {fmt_duration(seconds)})" if seconds is not None and seconds > 0 else ""
-    _notify(_with_safety(f"{emoji} {label} кіт вийшов з лотка{took}", frame), frame)
+    _notify(_with_safety(f"{emoji} {who} вийшов з лотка{took}", frame), frame)
 
 
 def notify_inside(cat: str, frame=None) -> None:
-    label = CAT_LABEL_UK.get(cat, cat)
     emoji = CAT_EMOJI.get(cat, "🐾")
-    _notify(f"{emoji} Кіт зайшов у лоток і сидить усередині ({label.lower()})", frame)
+    colour = f" ({CAT_LABEL_UK[cat].lower()})" if cat in ("white", "black") else ""
+    _notify(f"{emoji} Кіт зайшов у лоток і сидить усередині{colour}", frame)
